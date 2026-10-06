@@ -11,14 +11,15 @@ from starlette.concurrency import run_in_threadpool
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
-from . import charsets, config, generator, jobs
+from . import charsets, config, fontscan, generator, jobs
 
 MAX_UPLOAD = 30 * 1024 * 1024
 
 
 class PreviewRequest(BaseModel):
-    ref: int
+    refs: list[int] = Field(..., min_length=1, max_length=jobs.MAX_REFS)
     content_font: str
+    latin_font: str = ""
     steps: int = Field(20, ge=5, le=50)
     seed: int = 123
     text: str = Field(jobs.PREVIEW_TEXT, max_length=40)
@@ -29,8 +30,9 @@ class RunRequest(BaseModel):
     preset: str = "common"
     custom: str = Field("", max_length=20000)
     latin: bool = True
-    ref: int
+    refs: list[int] = Field(..., min_length=1, max_length=jobs.MAX_REFS)
     content_font: str
+    latin_font: str = ""
     steps: int = Field(20, ge=5, le=50)
     seed: int = 123
 
@@ -46,15 +48,24 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
             raise HTTPException(404, "找不到這個專案")
         return p
 
-    def check_inputs(p: jobs.Project, ref: int, content_font: str) -> None:
+    scanner = manager.scanner
+
+    def check_inputs(p: jobs.Project, req) -> None:
         if require_setup:
             problems = generator.check_setup()
             if problems:
                 raise HTTPException(409, "\n".join(problems))
-        if content_font not in {f.name for f in config.list_content_fonts()}:
+        if not scanner.ready.is_set():
+            raise HTTPException(409, "還在掃描字型，請稍候再試")
+        if req.content_font not in {f.id for f in scanner.content_fonts()}:
             raise HTTPException(400, "請先選擇內容字型")
-        if not (p.root / "refs" / f"{ref}.png").is_file():
-            raise HTTPException(400, "參考字不存在")
+        if req.latin_font and req.latin_font not in {f.id for f in scanner.latin_fonts()}:
+            raise HTTPException(400, "英數字字型不存在")
+        if len(set(req.refs)) != len(req.refs):
+            raise HTTPException(400, "參考字重複")
+        for ref in req.refs:
+            if not (p.root / "refs" / f"{ref}.png").is_file():
+                raise HTTPException(400, "參考字不存在")
 
     @app.get("/")
     def index():
@@ -64,10 +75,15 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
 
     @app.get("/api/status")
     def status():
+        fonts = scanner.content_fonts() if scanner.ready.is_set() else []
         return {
             "problems": generator.check_setup() if require_setup else [],
-            "content_fonts": [f.name for f in config.list_content_fonts()],
+            "scanning": not scanner.ready.is_set(),
+            "content_fonts": [{"id": f.id, "label": f.label, "coverage": f.cjk_coverage, "user": f.user,
+                               "recommended": bool(fontscan.PREFERRED_CONTENT.search(f.family + f.path))}
+                              for f in fonts],
             "fonts_dir": str(config.FONTS_DIR),
+            "max_refs": jobs.MAX_REFS,
             "presets": [{"id": k, "label": v} for k, v in charsets.PRESETS.items()],
             "preview_text": jobs.PREVIEW_TEXT,
         }
@@ -106,10 +122,18 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
             raise HTTPException(404)
         return FileResponse(path)
 
+    @app.get("/api/projects/{pid}/latin")
+    def latin_candidates(pid: str):
+        p = project_or_404(pid)
+        if not p.data["analysis"].get("ok") or not scanner.latin_ready.is_set():
+            return {"ready": scanner.latin_ready.is_set(), "candidates": []}
+        return {"ready": True, "candidates": [{"id": f.id, "label": f.label, "distance": round(d, 3)}
+                                              for f, d in manager.latin_candidates(p)]}
+
     @app.post("/api/projects/{pid}/preview")
     def preview(pid: str, req: PreviewRequest):
         p = project_or_404(pid)
-        check_inputs(p, req.ref, req.content_font)
+        check_inputs(p, req)
         return {"id": manager.submit_preview(p, req.model_dump())}
 
     @app.get("/api/projects/{pid}/previews/{preview_id}/{name}")
@@ -124,7 +148,7 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
     @app.post("/api/projects/{pid}/run")
     def run(pid: str, req: RunRequest):
         p = project_or_404(pid)
-        check_inputs(p, req.ref, req.content_font)
+        check_inputs(p, req)
         if req.preset not in charsets.PRESETS:
             raise HTTPException(400, "未知的字集")
         try:

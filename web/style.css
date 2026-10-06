@@ -66,6 +66,9 @@ h2 { margin: 0 0 12px; font-size: 18px; display: flex; align-items: center; gap:
 .refs button { padding: 0; border: 2px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; line-height: 0; }
 .refs button.sel { border-color: var(--sel); box-shadow: 0 0 0 2px var(--sel); }
 .refs img { width: 64px; height: 64px; border-radius: 6px; }
+.refs button { position: relative; }
+.refs button[data-order]:not([data-order=""])::after { content: attr(data-order); position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; line-height: 20px; border-radius: 50%; background: var(--sel); color: var(--card); font-size: 12px; text-align: center; }
+select { max-width: 100%; }
 .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin: 10px 0; }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
 label.grow { flex: 1 1 240px; }

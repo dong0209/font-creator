@@ -13,8 +13,10 @@ from PIL import Image, ImageOps
 
 MAX_SIDE = 3000
 STYLE_SIZE = 96
-# FontDiffuser 訓練用的字約佔畫布 86%，參考圖也照這個比例放
+# 方塊字高度約為字身的 86%（用來從行高推估字身大小）
 FILL_RATIO = 0.86
+# FontDiffuser 訓練資料中，風格字（目標字型）約佔畫布 80%，參考圖照這個比例放
+STYLE_FILL = 0.80
 
 
 @dataclass
@@ -215,7 +217,7 @@ def style_image(glyph: Glyph, size: int = STYLE_SIZE) -> Image.Image:
     以行高當作字身大小，讓英文字母保留和中文字之間的相對大小。
     """
     h, w = glyph.ink.shape
-    em = max(glyph.line_height, w, h) / FILL_RATIO
+    em = max(glyph.line_height, w, h) / STYLE_FILL
     side = int(np.ceil(max(em, w + 2, h + 2)))
     canvas = np.full((side, side), 255, np.uint8)
     x, y = (side - w) // 2, (side - h) // 2

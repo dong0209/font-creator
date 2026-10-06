@@ -39,8 +39,11 @@ def _is_fullwidth(ch: str) -> bool:
 @dataclass
 class GlyphSource:
     char: str
-    image: object  # PIL.Image 或灰階 numpy 陣列（生成結果）
-    placement: Placement
+    image: object = None  # PIL.Image 或灰階 numpy 陣列（AI 生成結果）
+    placement: Placement | None = None
+    weight_delta: float = 0.0  # 筆畫粗細修正（96px 像素）
+    contours: list | None = None  # 已描好的輪廓（英數字）
+    advance: int | None = None  # 搭配 contours 使用的字寬
 
 
 @dataclass
@@ -75,22 +78,30 @@ def build_font(spec: FontSpec, out_path: str | Path) -> dict:
         if cp in cmap:
             continue
         name = f"uni{cp:04X}" if cp <= 0xFFFF else f"u{cp:05X}"
-        contours = vectorize.trace(src.image, src.placement, UPM)
+        if src.contours is not None:
+            contours = src.contours
+        else:
+            contours = vectorize.trace(src.image, src.placement, UPM, src.weight_delta)
         span = vectorize.bounds(contours)
         if span is None:
             empty.append(src.char)
             continue
         p = src.placement
-        if _is_fullwidth(src.char):
-            dx = 0.0
-            advance = round(p.advance * UPM) or UPM
+        dy = 0.0
+        if src.advance is not None:
+            dx, advance = 0.0, src.advance
+        elif _is_fullwidth(src.char):
+            # 全形字：把內容字型的字身框中心對齊輸出字型的字身框中心
+            dx = (0.5 - p.advance / 2) * UPM
+            dy = (ASCENT + DESCENT) / 2 - p.em_cy * UPM
+            advance = UPM
         else:
             # 半形字：依生成後的實際字寬重算字距，左右留白沿用內容字型
             dx = p.lsb * UPM - span[0]
             advance = round(p.lsb * UPM + (span[1] - span[0]) + p.rsb * UPM)
         pen = TTGlyphPen(None)
-        vectorize.draw(contours, pen, dx)
-        glyf[name] = pen.glyph()
+        vectorize.draw(contours, pen, dx, dy)
+        glyf[name] = pen.glyph(dropImpliedOnCurves=True)
         order.append(name)
         cmap[cp] = name
         metrics[name] = (max(advance, 1), 0)

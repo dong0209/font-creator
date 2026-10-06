@@ -1,7 +1,7 @@
 """FontDiffuser 推論介面。
 
-FontDiffuser 原始碼與權重都不隨本專案散布（其 repo 未附授權條款），
-由使用者以 scripts/setup_fontdiffuser.py 下載原始碼、自行下載權重放到 vendor/ckpt。
+FontDiffuser 原始碼與權重不放進本專案，由 scripts/setup_fontdiffuser.py 下載原始碼、
+使用者自行下載權重放到 vendor/ckpt。
 """
 
 import os

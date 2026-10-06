@@ -1,7 +1,6 @@
 """下載 FontDiffuser 原始碼到 vendor/FontDiffuser，並檢查權重檔是否就位。
 
-FontDiffuser 的 repo 沒有附授權條款，所以本專案不重新散布它的程式碼與權重，
-由使用者自行下載，並自行評估使用上的授權風險。
+FontDiffuser 的程式碼與權重不放進本專案，由這個腳本下載原始碼、使用者自行下載權重。
 
 用法：python scripts/setup_fontdiffuser.py
 """
@@ -47,14 +46,15 @@ def main() -> int:
     else:
         print(f"✓ 權重檔已就位：{config.CKPT_DIR}")
 
+    config.FONTS_DIR.mkdir(parents=True, exist_ok=True)
     fonts = config.list_content_fonts()
-    if fonts:
-        print(f"✓ 內容字型：{', '.join(f.name for f in fonts)}")
+    if any("kaixin" in f.name.lower() for f in fonts):
+        print("✓ 已有開心宋體 A（FontDiffuser 訓練用的內容字型）")
     else:
-        config.FONTS_DIR.mkdir(parents=True, exist_ok=True)
         print()
-        print(f"✗ 還沒有內容字型，請把字型檔放到 {config.FONTS_DIR}（建議全字庫正宋體 TW-Sung，見 README）")
-    return 0 if not missing and fonts else 2
+        print("△ 建議下載「開心宋體 A」（KaiXinSongA.ttf）放到", config.FONTS_DIR)
+        print("  這是 FontDiffuser 訓練時用的內容字型，效果最好；沒有的話會改用電腦裡的宋體／明體。")
+    return 0 if not missing else 2
 
 
 if __name__ == "__main__":

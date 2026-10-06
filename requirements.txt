@@ -6,6 +6,7 @@ pillow>=10.0
 numpy>=1.26
 opencv-python-headless>=4.9
 fonttools>=4.50
+potracer>=0.0.4
 
 # FontDiffuser 推論
 torch>=2.1

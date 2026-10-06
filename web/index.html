@@ -49,10 +49,15 @@
 
     <section id="refs-card" class="card" hidden>
       <h2><span class="step">3</span>選擇風格參考字並試生成</h2>
-      <p class="muted">AI 會模仿你選的這一個字的風格來生成所有字。筆畫多、方正、清楚的中文字效果最好（已依適合程度排序）。</p>
+      <p class="muted">AI 會模仿參考字的風格來生成所有字。筆畫多、方正、清楚的中文字效果最好（已依適合程度排序）。點選可多選（最多 3 個）。</p>
       <div id="refs" class="refs"></div>
+      <p id="refs-count" class="small muted"></p>
       <div class="row">
-        <label>內容字型 <select id="content-font"></select></label>
+        <label class="grow">內容字型（中文字骨架） <select id="content-font"></select></label>
+        <label class="grow">英數字字型 <select id="latin-font"><option value="">自動（最接近的字型）</option></select></label>
+      </div>
+      <p id="content-hint" class="small muted"></p>
+      <div class="row">
         <label>生成步數 <select id="steps">
           <option value="10">10（快，品質較低）</option>
           <option value="15">15</option>
