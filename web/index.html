@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NC 字型產生器</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>NC 字型產生器</h1>
+    <p class="nc-note">產生的字型<strong>禁止用於商業用途</strong>，字型名稱會自動加上「NC」標記。</p>
+  </header>
+
+  <main>
+    <section id="setup" class="card warn" hidden>
+      <h2>尚未完成安裝</h2>
+      <ul id="setup-list"></ul>
+      <p>完成後重新整理此頁。安裝步驟請見 README。</p>
+    </section>
+
+    <section class="card">
+      <h2><span class="step">1</span>上傳圖片</h2>
+      <label id="drop" class="drop">
+        <input id="file" type="file" accept="image/*" hidden>
+        <span>拖曳圖片到這裡，或點擊選擇檔案</span>
+        <small>建議：字清楚、背景乾淨、每個字至少 60px 高，橫式排列</small>
+      </label>
+      <p id="upload-msg" class="msg"></p>
+      <details id="history" hidden>
+        <summary>先前的專案</summary>
+        <ul id="history-list"></ul>
+      </details>
+    </section>
+
+    <section id="analysis" class="card" hidden>
+      <h2><span class="step">2</span>文字特色分析</h2>
+      <div class="analysis-grid">
+        <div class="source-wrap"><img id="source" alt="上傳的圖片"><svg id="boxes"></svg></div>
+        <div>
+          <p class="style-guess"><span id="style-name"></span><span id="weight-name" class="pill"></span></p>
+          <p id="style-note" class="muted"></p>
+          <table class="features"><tbody id="features"></tbody></table>
+          <p id="analysis-meta" class="muted small"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="refs-card" class="card" hidden>
+      <h2><span class="step">3</span>選擇風格參考字並試生成</h2>
+      <p class="muted">AI 會模仿你選的這一個字的風格來生成所有字。筆畫多、方正、清楚的中文字效果最好（已依適合程度排序）。</p>
+      <div id="refs" class="refs"></div>
+      <div class="row">
+        <label>內容字型 <select id="content-font"></select></label>
+        <label>生成步數 <select id="steps">
+          <option value="10">10（快，品質較低）</option>
+          <option value="15">15</option>
+          <option value="20" selected>20（建議）</option>
+          <option value="30">30（慢）</option>
+        </select></label>
+        <label>隨機種子 <input id="seed" type="number" value="123" min="0"></label>
+      </div>
+      <div class="row">
+        <label class="grow">試生成文字 <input id="preview-text" maxlength="40"></label>
+        <button id="preview-btn" class="primary" disabled>試生成</button>
+      </div>
+      <div id="previews"></div>
+    </section>
+
+    <section id="run-card" class="card" hidden>
+      <h2><span class="step">4</span>生成完整字型</h2>
+      <div class="row">
+        <label class="grow">字型名稱 <input id="family" maxlength="40" placeholder="例如 MyHand"></label>
+        <span class="muted">實際名稱：<strong id="family-final">—</strong></span>
+      </div>
+      <div class="row presets" id="presets"></div>
+      <label id="custom-wrap" hidden>自訂字表（直接貼上要的字）<textarea id="custom" rows="3"></textarea></label>
+      <label class="check"><input id="latin" type="checkbox" checked> 包含英文、數字與符號</label>
+      <p id="estimate" class="muted"></p>
+      <div class="row">
+        <button id="run-btn" class="primary" disabled>開始生成</button>
+      </div>
+
+      <div id="progress" hidden>
+        <div class="bar"><div id="bar-fill"></div></div>
+        <p id="progress-text"></p>
+        <div class="row">
+          <button id="cancel-btn">暫停</button>
+          <button id="resume-btn" hidden>繼續</button>
+        </div>
+      </div>
+
+      <div id="done" hidden>
+        <p><a id="download" class="button primary" href="#">下載字型檔（.ttf）</a></p>
+        <p id="done-note" class="muted small"></p>
+        <label>試打文字<textarea id="tryout" rows="3">永和九年，歲在癸丑。The quick brown fox 0123456789</textarea></label>
+        <div id="tryout-view" class="tryout"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>本工具使用 FontDiffuser 生成字形；產出之字型僅供非商業用途。</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
