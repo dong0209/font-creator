@@ -15,6 +15,9 @@
 
 import hashlib
 import json
+import re
+import shutil
+import zipfile
 import queue
 import threading
 import time
@@ -25,7 +28,7 @@ from typing import Callable
 
 from PIL import Image
 
-from . import analyze, charsets, config, fontbuild, latin, quality, segment, vectorize
+from . import analyze, charsets, config, fontbuild, latin, quality, segment, specimen, vectorize
 from .content import ContentChain
 from .fontscan import FontScanner
 
@@ -42,6 +45,13 @@ class Project:
         self.root = root
         self.lock = threading.RLock()
         self.data = json.loads((root / "project.json").read_text("utf-8"))
+        if "groups" not in self.data:  # 舊版專案：整張圖當作一組
+            self.data["groups"] = [{"id": "g1", "name": "字型 A", "glyphs": [g["index"] for g in self.data["glyphs"]],
+                                    "analysis": self.data["analysis"], "default_ref": self.data.get("default_ref")}]
+
+    def group(self, group_id: str | None) -> dict:
+        groups = self.data["groups"]
+        return next((g for g in groups if g["id"] == group_id), groups[0]) if groups else {"analysis": self.data["analysis"]}
 
     @property
     def id(self) -> str:
@@ -79,6 +89,13 @@ def normalize_image(image: Image.Image) -> Image.Image:
     return image.convert("RGBA" if has_alpha else "RGB")
 
 
+def _group_entry(seg, number: int, ids: list[int]) -> dict:
+    report = analyze.analyze(seg, ids)
+    ranked = sorted(ids, key=lambda i: -seg.glyphs[i].score)
+    return {"id": f"g{number}", "name": f"字型 {chr(ord('A') + number - 1) if number <= 26 else number}",
+            "glyphs": ids, "analysis": report, "default_ref": ranked[0] if ranked else None}
+
+
 def create_project(work_dir: Path, image: Image.Image, filename: str = "") -> Project:
     pid = uuid.uuid4().hex[:12]
     root = work_dir / pid
@@ -93,6 +110,10 @@ def create_project(work_dir: Path, image: Image.Image, filename: str = "") -> Pr
         segment.style_image(g).save(root / "refs" / f"{g.index}.png")
         glyphs.append({"index": g.index, "line": g.line, "score": g.score,
                        "box": [g.box.x0, g.box.y0, g.box.x1, g.box.y1]})
+    groups = [_group_entry(seg, n, ids) for n, ids in enumerate(analyze.group_glyphs(seg), start=1)]
+    for group in groups:
+        for i in group["glyphs"]:
+            glyphs[i]["group"] = group["id"]
     ranked = sorted(glyphs, key=lambda g: -g["score"])
     data = {
         "id": pid,
@@ -100,6 +121,7 @@ def create_project(work_dir: Path, image: Image.Image, filename: str = "") -> Pr
         "filename": filename,
         "analysis": report,
         "glyphs": glyphs,
+        "groups": groups,
         "default_ref": ranked[0]["index"] if ranked else None,
         "run": None,
         "previews": [],
@@ -119,6 +141,11 @@ def split_chars(chars: list[str]) -> tuple[list[str], list[str]]:
     """分成 (AI 生成的中文與標點, 取自現成字型的英數字)。"""
     ai = [c for c in chars if c not in latin.LATIN_CHARS]
     return ai, [c for c in chars if c in latin.LATIN_CHARS]
+
+
+def _safe_dirname(name: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", name).strip(" .")
+    return cleaned or "font"
 
 
 class Manager:
@@ -172,20 +199,18 @@ class Manager:
         self.scanner.ready.wait()
         return ContentChain.from_faces(self.scanner.content_chain(face_id))
 
-    def latin_candidates(self, p: Project, limit: int = 8) -> list[tuple]:
-        target = latin.target_from_analysis(p.data["analysis"])
+    def latin_candidates(self, analysis: dict, limit: int = 8) -> list[tuple]:
+        target = latin.target_from_analysis(analysis)
         return latin.rank(target, self.scanner.latin_fonts(), limit)
 
-    def latin_styler(self, p: Project, face_id: str) -> latin.LatinStyler | None:
+    def latin_face(self, analysis: dict, face_id: str):
         self.scanner.ready.wait()
         face = self.scanner.get(face_id) if face_id else None
         if face is None:
             self.scanner.latin_ready.wait()
-            ranked = self.latin_candidates(p, 1)
+            ranked = self.latin_candidates(analysis, 1)
             face = ranked[0][0] if ranked else None
-        if face is None:
-            return None
-        return latin.LatinStyler(face, latin.target_from_analysis(p.data["analysis"]))
+        return face
 
     # ---------- 生成器 ----------
 
@@ -222,16 +247,28 @@ class Manager:
         return preview_id
 
     def submit_run(self, p: Project, settings: dict) -> None:
+        """settings：共用設定（字集、內容字型、步數、種子）＋ fonts：[{group, family, refs, latin_font}]。"""
         run = p.data.get("run")
         if run and run.get("status") in ("queued", "running"):
             raise RuntimeError("這個專案已經在生成中")
         chars = charsets.build_charset(settings["preset"], settings.get("custom", ""), settings.get("latin", True))
         if not chars:
             raise ValueError("字表是空的")
+        if not settings.get("fonts"):
+            raise ValueError("請至少選擇一組要匯出的字型")
+        families = [fontbuild.nc_family_name(f["family"]) for f in settings["fonts"]]
+        if len(set(families)) != len(families):
+            raise ValueError("各組字型的名稱不能重複")
         ai_chars, _ = split_chars(chars)
-        p.data["run"] = {**settings, "key": run_key(settings), "status": "queued", "total": len(ai_chars),
-                         "done": 0, "skipped": [], "message": "排隊中", "started": None,
-                         "rate": None, "output": None}
+        shared = {k: v for k, v in settings.items() if k != "fonts"}
+        fonts = []
+        for f, family in zip(settings["fonts"], families):
+            entry = {"group": f["group"], "family": family, "refs": f["refs"], "latin_font": f.get("latin_font", "")}
+            entry["key"] = run_key({**shared, "refs": f["refs"]})
+            entry.update(status="pending", done=0, total=len(ai_chars), skipped=[], outputs=[])
+            fonts.append(entry)
+        p.data["run"] = {**shared, "fonts": fonts, "status": "queued", "total": len(ai_chars) * len(fonts),
+                         "done": 0, "message": "排隊中", "started": None, "rate": None, "package": None}
         p.save()
         self._cancel.discard(p.id)
         self._queue.put(("run", p.id, None))
@@ -273,37 +310,48 @@ class Manager:
 
     # ---------- 共用：組字型 ----------
 
-    def _sources(self, p: Project, chain: ContentChain, images: dict[str, Image.Image],
-                 latin_chars: list[str], latin_face: str) -> tuple[list, int | None, str | None]:
-        """AI 字圖＋英數字 → GlyphSource 清單（含粗細一致化）。"""
-        rendered = {c: chain.render(c) for c in images}
-        rendered = {c: r for c, r in rendered.items() if r is not None}
+    def _prepare(self, chain: ContentChain, images: dict[str, Image.Image]) -> list[dict]:
+        """量每個 AI 字的筆畫粗細，算出一致化修正。回傳 [{char, image, placement, delta, stroke}]。"""
+        items = []
         gen_w, content_w = {}, {}
-        for c, (content_img, _) in rendered.items():
-            g = quality.binarize(images[c])
+        for c, img in images.items():
+            r = chain.render(c)
+            if r is None:
+                continue
+            g = quality.binarize(img)
             gen_w[c] = vectorize.stroke_width(g) if g.any() else 0.0
-            cb = quality.content_binary(content_img, images[c].size[0])
+            cb = quality.content_binary(r[0], img.size[0])
             content_w[c] = vectorize.stroke_width(cb) if cb.any() else 0.0
+            items.append({"char": c, "image": img, "placement": r[1]})
         corrections = quality.weight_corrections(gen_w, content_w)
-        sources = [fontbuild.GlyphSource(c, images[c], placement, weight_delta=corrections.get(c, 0.0))
-                   for c, (_, placement) in rendered.items()]
+        for it in items:
+            it["delta"] = corrections.get(it["char"], 0.0)
+            it["stroke"] = gen_w[it["char"]] + 2 * it["delta"]  # 一致化後的粗細
+        return items
 
-        space, latin_name = None, None
-        if latin_chars:
-            styler = self.latin_styler(p, latin_face)
-            if styler is not None:
-                latin_name = styler.face.label
-                space = styler.space_advance()
-                for c in latin_chars:
-                    g = styler.glyph(c)
-                    if g is not None:
-                        sources.append(fontbuild.GlyphSource(c, contours=g[0], advance=g[1]))
-        return sources, space, latin_name
+    def _sources(self, items: list[dict], latin_chars: list[str], face, analysis: dict,
+                 ratio: float = 1.0) -> tuple[list, int | None]:
+        """組成一個字重的 GlyphSource 清單。ratio：相對於分析字重的筆畫粗細倍率。"""
+        sources = [fontbuild.GlyphSource(it["char"], it["image"], it["placement"],
+                                         weight_delta=it["delta"] + (ratio - 1) * it["stroke"] / 2)
+                   for it in items]
+        space = None
+        if latin_chars and face is not None:
+            target = latin.target_from_analysis(analysis)
+            target["stroke"] *= ratio
+            styler = latin.LatinStyler(face, target)
+            space = styler.space_advance()
+            for c in latin_chars:
+                g = styler.glyph(c)
+                if g is not None:
+                    sources.append(fontbuild.GlyphSource(c, contours=g[0], advance=g[1]))
+        return sources, space
 
-    def _spec(self, p: Project, family: str, sources: list, chain: ContentChain, space: int | None):
-        a = p.data["analysis"]
-        return fontbuild.FontSpec(family=family, glyphs=sources, weight=a.get("weight", 400),
-                                  italic_angle=a.get("slant", 0.0),
+    @staticmethod
+    def _spec(analysis: dict, family: str, sources: list, chain: ContentChain, space: int | None,
+              weight: int | None = None, style: str = "Regular"):
+        return fontbuild.FontSpec(family=family, glyphs=sources, weight=weight or analysis.get("weight", 400),
+                                  style=style, italic_angle=analysis.get("slant", 0.0),
                                   space_advance=(space / 1000) if space else chain.space_advance())
 
     # ---------- 試生成 ----------
@@ -320,6 +368,7 @@ class Manager:
         if entry is None:
             return
         s = entry["settings"]
+        analysis = p.group(s.get("group"))["analysis"]
         self._set_preview(p, preview_id, status="running", message="載入模型與生成中…")
         chain = self.content_chain(s["content_font"])
         text = [c for c in dict.fromkeys(s.get("text") or PREVIEW_TEXT) if not c.isspace()]
@@ -338,68 +387,166 @@ class Manager:
             for (c, _), img in zip(items, results):
                 img.save(out_dir / f"{ord(c):X}.png")
                 images[c] = img
-        sources, space, latin_name = self._sources(p, chain, images, latin_chars, s.get("latin_font", ""))
-        fontbuild.build_font(self._spec(p, f"Preview {preview_id}", sources, chain, space), out_dir / "preview.ttf")
+        face = self.latin_face(analysis, s.get("latin_font", "")) if latin_chars else None
+        sources, space = self._sources(self._prepare(chain, images), latin_chars, face, analysis)
+        fontbuild.build_font(self._spec(analysis, f"Preview {preview_id}", sources, chain, space), out_dir / "preview.ttf")
         self._set_preview(p, preview_id, status="done", chars=[c for c, _ in items], latin=latin_chars,
-                          latin_font=latin_name, seconds=round(seconds, 2),
+                          latin_font=face.label if face else None, seconds=round(seconds, 2),
                           per_glyph=round(seconds / len(items), 3) if items else None, message="")
 
     # ---------- 正式生成 ----------
+
+    def _update_font(self, p: Project, index: int, **fields) -> None:
+        with p.lock:
+            p.data["run"]["fonts"][index].update(fields)
+            p.save()
 
     def _do_run(self, p: Project) -> None:
         run = p.data["run"]
         chain = self.content_chain(run["content_font"])
         chars = charsets.build_charset(run["preset"], run.get("custom", ""), run.get("latin", True))
         ai_chars, latin_chars = split_chars(chars)
-        glyph_dir = p.root / "glyphs" / run["key"]
-        glyph_dir.mkdir(parents=True, exist_ok=True)
+        p.update_run(status="running", message="準備中…", started=run.get("started") or _now())
 
+        # 1. 依序生成每一組的字圖（已生成的會跳過，可中斷續跑）
+        for index, font in enumerate(run["fonts"]):
+            if not self._generate_font(p, index, chain, ai_chars):
+                return  # 已暫停
+
+        # 2. 描圖、衍生字重、輸出各種格式與樣張
+        out_root = p.root / "output"
+        if out_root.exists():
+            shutil.rmtree(out_root)
+        for index, font in enumerate(run["fonts"]):
+            self._build_family(p, index, chain, ai_chars, latin_chars, out_root)
+
+        # 3. 打包
+        p.update_run(message="打包字型包中…")
+        package = self._package(p, out_root)
+        p.update_run(status="done", message="完成", package=package.name, finished=_now())
+
+    def _generate_font(self, p: Project, index: int, chain: ContentChain, ai_chars: list[str]) -> bool:
+        run = p.data["run"]
+        font = run["fonts"][index]
+        glyph_dir = p.root / "glyphs" / font["key"]
+        glyph_dir.mkdir(parents=True, exist_ok=True)
         todo, skipped = [], []
         for c in ai_chars:
             if not chain.has(c):
                 skipped.append(c)
             elif not (glyph_dir / f"{ord(c):X}.png").exists():
                 todo.append(c)
-        done = len(ai_chars) - len(skipped) - len(todo)
-        p.update_run(status="running", message="載入模型中…", skipped=skipped,
-                     total=len(ai_chars) - len(skipped), done=done, started=run.get("started") or _now())
+        total = len(ai_chars) - len(skipped)
+        self._update_font(p, index, status="generating", skipped=skipped, total=total, done=total - len(todo))
+        self._sync_totals(p)
 
         gen = self._get_generator(run["steps"]) if todo else None
         t0, made = time.time(), 0
         step = gen.batch_size if gen else 1
+        label = f"{font['family']}（第 {index + 1} / {len(run['fonts'])} 套）"
         for i in range(0, len(todo), step):
             if p.id in self._cancel:
                 self._cancel.discard(p.id)
                 p.update_run(status="paused", message="已暫停，按「繼續」接著生成")
-                return
-            batch = []
-            for c in todo[i : i + step]:
-                r = chain.render(c)
-                if r is None:
-                    skipped.append(c)
-                else:
-                    batch.append((c, r[0]))
-            images = self._generate_best(gen, p, run["refs"], [img for _, img in batch], run["seed"] + i)
+                return False
+            batch = [(c, chain.render(c)) for c in todo[i : i + step]]
+            batch = [(c, r[0]) for c, r in batch if r is not None]
+            images = self._generate_best(gen, p, font["refs"], [img for _, img in batch], run["seed"] + i)
             for (c, _), img in zip(batch, images):
                 img.save(glyph_dir / f"{ord(c):X}.png")
             made += len(batch)
-            done += len(batch)
             rate = (time.time() - t0) / made
+            self._update_font(p, index, done=total - len(todo) + i + len(batch))
             note = getattr(gen, "fallback_reason", None)
-            p.update_run(done=done, rate=round(rate, 3), skipped=skipped,
-                         message=f"生成中（每字約 {rate:.2f} 秒）" + (f"\n{note}" if note else ""))
+            self._sync_totals(p, rate=round(rate, 3),
+                              message=f"生成 {label}中（每字約 {rate:.2f} 秒）" + (f"\n{note}" if note else ""))
+        self._update_font(p, index, status="generated")
+        return True
 
-        p.update_run(message="描圖並組合字型檔中…")
+    def _sync_totals(self, p: Project, **fields) -> None:
+        fonts = p.data["run"]["fonts"]
+        p.update_run(done=sum(f["done"] for f in fonts), total=sum(f["total"] for f in fonts), **fields)
+
+    def _build_family(self, p: Project, index: int, chain: ContentChain, ai_chars: list[str],
+                      latin_chars: list[str], out_root: Path) -> None:
+        run = p.data["run"]
+        font = run["fonts"][index]
+        analysis = p.group(font["group"])["analysis"]
+        glyph_dir = p.root / "glyphs" / font["key"]
+        label = f"{font['family']}（第 {index + 1} / {len(run['fonts'])} 套）"
+        p.update_run(message=f"{label}：分析筆畫粗細…")
+        self._update_font(p, index, status="building")
         images = {}
         for c in ai_chars:
             path = glyph_dir / f"{ord(c):X}.png"
             if path.exists():
                 images[c] = Image.open(path).convert("L")
-        sources, space, latin_name = self._sources(p, chain, images, latin_chars, run.get("latin_font", ""))
-        family = fontbuild.nc_family_name(run["family"])
-        out = p.root / "output" / f"{fontbuild._ps_name(family)}.ttf"
-        info = fontbuild.build_font(self._spec(p, family, sources, chain, space), out,
-                                    progress=lambda i, n: p.update_run(message=f"描圖並組合字型檔中…（{i:,} / {n:,}）"))
-        p.update_run(status="done", message="完成", output=out.name, family=info["family"],
-                     glyph_count=info["glyphs"], empty=info["empty"], latin_font_name=latin_name,
-                     finished=_now())
+        items = self._prepare(chain, images)
+        face = self.latin_face(analysis, font.get("latin_font", "")) if latin_chars else None
+
+        family = font["family"]
+        folder = out_root / _safe_dirname(family)
+        base_weight = analysis.get("weight", 400)
+        variants = analyze.weight_variants(base_weight)
+        base_stroke = analyze.stroke_for_weight(base_weight)
+        outputs = []
+        for vi, (style, weight) in enumerate(variants):
+            ratio = analyze.stroke_for_weight(weight) / base_stroke
+            sources, space = self._sources(items, latin_chars, face, analysis, ratio)
+            stem = f"{fontbuild._ps_name(family)}-{style.replace(' ', '')}"
+            msg = f"{label}：描圖 {style}（{vi + 1} / {len(variants)} 種字重）"
+            info = fontbuild.build_font(
+                self._spec(analysis, family, sources, chain, space, weight, style), folder / "TTF" / f"{stem}.ttf",
+                progress=lambda i, n, msg=msg: p.update_run(message=f"{msg}…（{i:,} / {n:,}）"),
+                formats=("ttf", "otf", "woff2"))
+            files = info["files"]
+            # 依格式分資料夾
+            for fmt, folder_name in (("otf", "OTF"), ("woff2", "WOFF2")):
+                dest = folder / folder_name / Path(files[fmt]).name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(files[fmt], dest)
+                files[fmt] = str(dest)
+            outputs.append({"style": style, "weight": weight, "glyphs": info["glyphs"], "empty": info["empty"],
+                            "files": {k: str(Path(v).relative_to(out_root)) for k, v in files.items()}})
+
+        p.update_run(message=f"{label}：產生樣張…")
+        self._write_css(folder, family, outputs, out_root)
+        weights = [{"style": o["style"], "weight": o["weight"], "ttf": str(out_root / o["files"]["ttf"])} for o in outputs]
+        ui_font = str(chain.fonts[0].path)
+        specimen.render_specimen(family, weights, folder / "樣張.png", ui_font)
+        regular = min(weights, key=lambda w: abs(w["weight"] - base_weight))
+        specimen.render_glyph_chart(family, regular["ttf"], folder / "全字表.pdf", ui_font)
+        self._update_font(p, index, status="done", outputs=outputs, folder=folder.name,
+                          latin_font_name=face.label if face else None,
+                          glyph_count=outputs[0]["glyphs"] if outputs else 0)
+
+    @staticmethod
+    def _write_css(folder: Path, family: str, outputs: list[dict], out_root: Path) -> None:
+        rules = []
+        for o in outputs:
+            woff2 = Path(o["files"]["woff2"]).relative_to(folder.name)
+            rules.append(
+                "@font-face {\n"
+                f'  font-family: "{family}";\n'
+                f'  src: url("{woff2.as_posix()}") format("woff2");\n'
+                f"  font-weight: {o['weight']};\n"
+                "  font-style: normal;\n"
+                "  font-display: swap;\n"
+                "}\n")
+        example = (f'/* 用法：<link rel="stylesheet" href="fonts.css">，再設定\n'
+                   f'   body {{ font-family: "{family}", sans-serif; }}\n'
+                   "   此字型禁止用於商業用途。 */\n\n")
+        (folder / "fonts.css").write_text(example + "\n".join(rules), "utf-8")
+
+    @staticmethod
+    def _package(p: Project, out_root: Path) -> Path:
+        names = [f["family"] for f in p.data["run"]["fonts"]]
+        stem = _safe_dirname(names[0] if len(names) == 1 else f"{names[0]} 等 {len(names)} 套字型")
+        for old in p.root.glob("*.zip"):
+            old.unlink()
+        zip_path = p.root / f"{stem}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(out_root.rglob("*")):
+                if path.is_file():
+                    zf.write(path, path.relative_to(out_root).as_posix())
+        return zip_path

@@ -1,7 +1,8 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { status: null, project: null, ref: null, polling: null, fontVersion: 0 };
+// groups：各字型分組的設定 { [id]: { export, family, refs, latinFont } }；active：目前檢視的分組
+const state = { status: null, project: null, groups: {}, active: null, polling: null };
 
 async function api(path, options = {}) {
   const res = await fetch(path, options);
@@ -40,18 +41,22 @@ function setMsg(id, text, error = false) {
   node.classList.toggle("error", error);
 }
 
+const ncName = (name) => {
+  const base = name.trim().replace(/\s+NC$/i, "");
+  return base ? `${base} NC` : "";
+};
+const groupOf = (id) => (state.project.groups || []).find((g) => g.id === id) || state.project.groups[0];
+const activeConf = () => state.groups[state.active];
+
 // ---------- 初始狀態 ----------
 
 async function loadStatus() {
   const s = await api("/api/status");
   state.status = s;
-  const setup = $("setup");
-  const list = $("setup-list");
-  list.replaceChildren();
   const problems = [...s.problems];
   if (!s.scanning && !s.content_fonts.length) problems.push(`找不到中文字型：請把字型檔放到 ${s.fonts_dir}`);
-  problems.forEach((p) => list.append(el("li", {}, p)));
-  setup.hidden = problems.length === 0;
+  $("setup-list").replaceChildren(...problems.map((p) => el("li", {}, p)));
+  $("setup").hidden = problems.length === 0;
 
   const sel = $("content-font");
   const current = sel.value;
@@ -65,22 +70,23 @@ async function loadStatus() {
   if (s.scanning) setTimeout(loadStatus, 2000);
   if (!$("preview-text").value) $("preview-text").value = s.preview_text;
 
-  const presets = $("presets");
-  presets.replaceChildren(...s.presets.map((p, i) => {
-    const input = el("input", { type: "radio", name: "preset", value: p.id });
-    if (p.id === "common") input.checked = true;
-    input.addEventListener("change", onPresetChange);
-    return el("label", {}, input, p.label);
-  }));
+  if (!document.querySelector('input[name="preset"]')) {
+    $("presets").replaceChildren(...s.presets.map((p) => {
+      const input = el("input", { type: "radio", name: "preset", value: p.id });
+      if (p.id === "common") input.checked = true;
+      input.addEventListener("change", onPresetChange);
+      return el("label", {}, input, p.label);
+    }));
+  }
   onPresetChange();
   state.ready = !s.scanning && s.content_fonts.length > 0;
   $("preview-btn").disabled = !state.ready;
+  if (state.project) renderRun(state.project);
 }
 
 async function loadHistory() {
   const items = await api("/api/projects");
-  const list = $("history-list");
-  list.replaceChildren(...items.slice(0, 20).map((p) => {
+  $("history-list").replaceChildren(...items.slice(0, 20).map((p) => {
     const when = new Date(p.created * 1000).toLocaleString("zh-TW");
     const run = p.run ? `（${runLabel(p.run)}）` : "";
     return el("li", {}, el("a", { href: `#${p.id}`, onclick: (e) => { e.preventDefault(); openProject(p.id); } },
@@ -130,18 +136,42 @@ async function openProject(id) {
   }
 }
 
+function initGroups(p) {
+  // 預設：3 個字以上的分組都匯出
+  state.groups = {};
+  for (const g of p.groups || []) {
+    state.groups[g.id] = {
+      export: g.glyphs.length >= 3 || p.groups.length === 1,
+      family: "",
+      refs: g.default_ref === null ? [] : [g.default_ref],
+      latinFont: "",
+    };
+  }
+  const run = p.run;
+  if (run && run.fonts) {  // 還原上次的設定
+    for (const conf of Object.values(state.groups)) conf.export = false;
+    for (const f of run.fonts) {
+      if (!state.groups[f.group]) continue;
+      Object.assign(state.groups[f.group], {
+        export: true, family: f.family.replace(/\s+NC$/i, ""), refs: [...f.refs], latinFont: f.latin_font || "",
+      });
+    }
+  }
+  const first = (p.groups || []).find((g) => state.groups[g.id].export) || (p.groups || [])[0];
+  state.active = first ? first.id : null;
+}
+
 function showProject(p) {
   const fresh = !state.project || state.project.id !== p.id;
   state.project = p;
   history.replaceState(null, "", `#${p.id}`);
   if (fresh) {
-    state.refs = p.run && p.run.refs ? [...p.run.refs] : (p.default_ref === null ? [] : [p.default_ref]);
-    state.latinWanted = p.run ? p.run.latin_font || "" : "";
-    renderAnalysis(p);
-    renderRefs(p);
-    loadLatin(p);
+    state.secPerGlyph = undefined;
+    initGroups(p);
     if (p.run) restoreRunSettings(p.run);
-    onFamilyInput();
+    renderSource(p);
+    renderGroups();
+    selectGroup(state.active);
   }
   renderPreviews(p);
   renderRun(p);
@@ -149,7 +179,6 @@ function showProject(p) {
 }
 
 function restoreRunSettings(run) {
-  if (run.family) $("family").value = run.family.replace(/\s+NC$/i, "");
   const radio = document.querySelector(`input[name="preset"][value="${run.preset}"]`);
   if (radio) radio.checked = true;
   $("custom").value = run.custom || "";
@@ -157,23 +186,71 @@ function restoreRunSettings(run) {
   if (run.steps) $("steps").value = String(run.steps);
   if (run.seed !== undefined) $("seed").value = String(run.seed);
   if (run.content_font) $("content-font").value = run.content_font;
-  if (run.latin_font !== undefined) $("latin-font").value = run.latin_font;
   onPresetChange();
 }
 
-function renderAnalysis(p) {
-  const a = p.analysis;
+function renderSource(p) {
   $("analysis").hidden = false;
   const img = $("source");
   img.src = `/api/projects/${p.id}/source`;
   img.onload = () => drawBoxes(p, img.naturalWidth, img.naturalHeight);
-  if (!a.ok) {
-    $("style-name").textContent = a.message;
+  const ok = (p.groups || []).length > 0 && p.analysis.ok;
+  $("refs-card").hidden = !ok;
+  $("run-card").hidden = !ok;
+  if (!ok) {
+    $("groups-wrap").hidden = true;
+    $("style-name").textContent = p.analysis.message || "圖片中找不到文字";
     $("weight-name").textContent = "";
     $("style-note").textContent = "";
     $("features").replaceChildren();
-    $("refs-card").hidden = true;
-    $("run-card").hidden = true;
+    $("analysis-meta").textContent = "";
+    $("analysis-warn").replaceChildren();
+  }
+}
+
+function renderGroups() {
+  const p = state.project;
+  const groups = p.groups || [];
+  $("groups-wrap").hidden = groups.length < 2;
+  $("group-count").textContent = String(groups.length);
+  $("groups").replaceChildren(...groups.map((g, n) => {
+    const conf = state.groups[g.id];
+    const check = el("input", { type: "checkbox", "aria-label": `匯出${g.name}` });
+    check.checked = conf.export;
+    check.addEventListener("click", (e) => e.stopPropagation());
+    check.addEventListener("change", () => { conf.export = check.checked; renderFontList(); });
+    const thumbs = [...g.glyphs].sort((a, b) => p.glyphs[b].score - p.glyphs[a].score).slice(0, 4)
+      .map((i) => el("img", { src: `/api/projects/${p.id}/refs/${i}.png`, alt: "" }));
+    const card = el("div", { class: `group-card c${n % 6}`, "data-id": g.id, role: "button", tabindex: "0" },
+      el("div", { class: "group-head" }, check, el("strong", {}, g.name), el("span", { class: "small muted" }, "匯出")),
+      el("div", { class: "group-thumbs" }, ...thumbs),
+      el("p", { class: "small muted" }, `${g.glyphs.length} 字・${g.analysis.ok ? g.analysis.style : "無法分析"}`));
+    card.addEventListener("click", () => selectGroup(g.id));
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter") selectGroup(g.id); });
+    return card;
+  }));
+}
+
+function selectGroup(id) {
+  if (!id) return;
+  state.active = id;
+  const g = groupOf(id);
+  const many = state.project.groups.length > 1;
+  document.querySelectorAll(".group-card").forEach((c) => c.classList.toggle("active", c.dataset.id === id));
+  renderAnalysis(g);
+  renderRefs(g);
+  $("refs-group").textContent = many ? g.name : "";
+  $("refs-group").hidden = !many;
+  loadLatin(state.project, g.id);
+  renderFontList();
+}
+
+function renderAnalysis(g) {
+  const a = g.analysis;
+  if (!a.ok) {
+    $("style-name").textContent = a.message;
+    $("weight-name").textContent = "";
+    $("features").replaceChildren();
     return;
   }
   $("style-name").textContent = a.style;
@@ -181,35 +258,43 @@ function renderAnalysis(p) {
   $("style-note").textContent = a.style_note;
   $("features").replaceChildren(...a.features.map((f) =>
     el("tr", {}, el("td", {}, f.label), el("td", {}, f.value === null ? "—" : `${f.value} ${f.unit}`), el("td", {}, f.text))));
-  $("analysis-meta").textContent = `偵測到 ${a.glyph_count} 個字、${a.line_count} 行${a.inverted ? "（淺字深底，已自動反相）" : ""}。`;
+  const inv = state.project.analysis.inverted ? "（淺字深底，已自動反相）" : "";
+  const scope = state.project.groups.length > 1 ? "此組" : "偵測到";
+  $("analysis-meta").textContent = `${scope} ${a.glyph_count} 個字、${a.line_count} 行${inv}。`;
   $("analysis-warn").replaceChildren(...(a.warnings || []).map((w) => el("li", {}, w)));
-  $("refs-card").hidden = false;
-  $("run-card").hidden = false;
 }
 
 function drawBoxes(p, w, h) {
+  const img = $("source");
+  w = w || img.naturalWidth;
+  h = h || img.naturalHeight;
+  if (!w || !h) return;
   // 切字是在縮圖後的座標上做的（長邊最多 3000px）
   const scale = Math.max(w, h) > 3000 ? 3000 / Math.max(w, h) : 1;
   const svg = $("boxes");
   svg.setAttribute("viewBox", `0 0 ${w * scale} ${h * scale}`);
   svg.setAttribute("preserveAspectRatio", "none");
+  const order = (p.groups || []).map((g) => g.id);
+  const refs = activeConf() ? activeConf().refs : [];
   svg.replaceChildren(...p.glyphs.map((g) => {
     const [x0, y0, x1, y1] = g.box;
     const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     r.setAttribute("x", x0); r.setAttribute("y", y0);
     r.setAttribute("width", x1 - x0); r.setAttribute("height", y1 - y0);
-    r.dataset.index = g.index;
-    if (state.refs.includes(g.index)) r.classList.add("sel");
+    const gi = Math.max(order.indexOf(g.group), 0);
+    const dim = order.length > 1 && g.group !== state.active ? " dim" : "";
+    r.setAttribute("class", `c${gi % 6}${dim}${refs.includes(g.index) ? " sel" : ""}`);
     return r;
   }));
 }
 
-function renderRefs(p) {
-  const sorted = [...p.glyphs].sort((a, b) => b.score - a.score);
-  $("refs").replaceChildren(...sorted.map((g) => {
-    const btn = el("button", { type: "button", title: `適合度 ${Math.round(g.score * 100)}`, "data-index": g.index },
-      el("img", { src: `/api/projects/${p.id}/refs/${g.index}.png`, alt: `參考字 ${g.index}` }));
-    btn.addEventListener("click", () => toggleRef(g.index));
+function renderRefs(g) {
+  const p = state.project;
+  const sorted = [...g.glyphs].sort((a, b) => p.glyphs[b].score - p.glyphs[a].score);
+  $("refs").replaceChildren(...sorted.map((i) => {
+    const btn = el("button", { type: "button", title: `適合度 ${Math.round(p.glyphs[i].score * 100)}`, "data-index": i },
+      el("img", { src: `/api/projects/${p.id}/refs/${i}.png`, alt: `參考字 ${i}` }));
+    btn.addEventListener("click", () => toggleRef(i));
     return btn;
   }));
   updateRefs();
@@ -217,48 +302,46 @@ function renderRefs(p) {
 
 function toggleRef(index) {
   const max = (state.status && state.status.max_refs) || 3;
-  if (state.refs.includes(index)) {
-    if (state.refs.length > 1) state.refs = state.refs.filter((i) => i !== index);
-  } else if (state.refs.length < max) {
-    state.refs.push(index);
+  const conf = activeConf();
+  if (conf.refs.includes(index)) {
+    if (conf.refs.length > 1) conf.refs = conf.refs.filter((i) => i !== index);
+  } else if (conf.refs.length < max) {
+    conf.refs.push(index);
   } else {
-    state.refs = [...state.refs.slice(1), index];  // 已滿：換掉最早選的
+    conf.refs = [...conf.refs.slice(1), index];  // 已滿：換掉最早選的
   }
   updateRefs();
 }
 
-function setRefs(refs) {
-  state.refs = [...refs];
-  updateRefs();
-}
-
 function updateRefs() {
-  updateEstimate();
-  const on = (i) => state.refs.includes(Number(i));
+  const conf = activeConf();
+  if (!conf) return;
   document.querySelectorAll("#refs button").forEach((b) => {
-    b.classList.toggle("sel", on(b.dataset.index));
-    const order = state.refs.indexOf(Number(b.dataset.index));
+    const order = conf.refs.indexOf(Number(b.dataset.index));
+    b.classList.toggle("sel", order >= 0);
     b.dataset.order = order >= 0 ? String(order + 1) : "";
   });
-  document.querySelectorAll("#boxes rect").forEach((r) => r.classList.toggle("sel", on(r.dataset.index)));
-  const n = state.refs.length;
+  drawBoxes(state.project);
+  const n = conf.refs.length;
   $("refs-count").textContent = n > 1
     ? `已選 ${n} 個參考字：每個字會生成 ${n} 次並自動挑最好的，時間約 ${n} 倍。`
     : "已選 1 個參考字。可再多選 1–2 個，品質更穩定，但時間會等比增加。";
+  renderFontList();
 }
 
 // ---------- 英數字字型 ----------
 
-async function loadLatin(p) {
+async function loadLatin(p, groupId) {
   const sel = $("latin-font");
   try {
-    const res = await api(`/api/projects/${p.id}/latin`);
+    const res = await api(`/api/projects/${p.id}/latin?group=${encodeURIComponent(groupId)}`);
+    if (state.active !== groupId || state.project.id !== p.id) return;
     if (!res.ready) {
       sel.replaceChildren(el("option", { value: "" }, "比對字型中…"));
-      if (state.project && state.project.id === p.id) setTimeout(() => loadLatin(p), 3000);
+      setTimeout(() => { if (state.active === groupId) loadLatin(p, groupId); }, 3000);
       return;
     }
-    const wanted = sel.value || state.latinWanted || "";
+    const wanted = activeConf().latinFont;
     const options = res.candidates.map((c, i) => el("option", { value: c.id }, `${i === 0 ? "最接近：" : ""}${c.label}`));
     sel.replaceChildren(el("option", { value: "" }, "自動（最接近的字型）"), ...options);
     sel.value = [...sel.options].some((o) => o.value === wanted) ? wanted : "";
@@ -266,14 +349,13 @@ async function loadLatin(p) {
     sel.replaceChildren(el("option", { value: "" }, "自動（最接近的字型）"));
   }
 }
+$("latin-font").addEventListener("change", () => { activeConf().latinFont = $("latin-font").value; });
 
 // ---------- 試生成 ----------
 
-function genSettings() {
+function shared() {
   return {
-    refs: state.refs,
     content_font: $("content-font").value,
-    latin_font: $("latin-font").value,
     steps: Number($("steps").value),
     seed: Number($("seed").value) || 0,
   };
@@ -282,11 +364,13 @@ function genSettings() {
 $("preview-btn").addEventListener("click", async () => {
   const p = state.project;
   if (!p) return;
+  const conf = activeConf();
   try {
     await api(`/api/projects/${p.id}/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...genSettings(), text: $("preview-text").value }),
+      body: JSON.stringify({ ...shared(), group: state.active, refs: conf.refs, latin_font: conf.latinFont,
+        text: $("preview-text").value }),
     });
     openProject(p.id);
   } catch (err) {
@@ -295,11 +379,12 @@ $("preview-btn").addEventListener("click", async () => {
 });
 
 function renderPreviews(p) {
-  const box = $("previews");
-  const refName = (s) => `參考字 ${(s.refs || []).map((r) => `#${r}`).join("、")}・${s.steps} 步・種子 ${s.seed}`;
-  box.replaceChildren(...(p.previews || []).map((v) => {
+  const groupName = (id) => (p.groups.length > 1 && id ? `${groupOf(id).name}・` : "");
+  $("previews").replaceChildren(...(p.previews || []).map((v) => {
+    const s = v.settings;
     const wrap = el("div", { class: "preview" });
-    const head = el("p", { class: "small muted" }, refName(v.settings));
+    const head = el("p", { class: "small muted" },
+      `${groupName(s.group)}參考字 ${(s.refs || []).map((r) => `#${r}`).join("、")}・${s.steps} 步・種子 ${s.seed}`);
     wrap.append(head);
     if (v.status === "queued" || v.status === "running") {
       wrap.append(el("p", {}, v.status === "queued" ? "排隊中…" : (v.message || "生成中…")));
@@ -318,20 +403,23 @@ function renderPreviews(p) {
       if (v.latin_font) wrap.append(el("p", { class: "small muted" }, `英數字字型：${v.latin_font}`));
       const per = v.per_glyph || 0;
       if (per) head.append(`・每字約 ${per.toFixed(2)} 秒`);
-      const useBtn = el("button", { type: "button" }, "用這組設定生成完整字型");
+      const useBtn = el("button", { type: "button" }, "用這組設定");
       useBtn.addEventListener("click", () => {
-        setRefs(v.settings.refs || []);
-        $("latin-font").value = v.settings.latin_font || "";
-        $("steps").value = String(v.settings.steps);
-        $("seed").value = String(v.settings.seed);
-        $("content-font").value = v.settings.content_font;
-        state.secPerGlyph = per / Math.max((v.settings.refs || [1]).length, 1);
+        if (s.group && state.groups[s.group]) {
+          Object.assign(state.groups[s.group], { refs: [...(s.refs || [])], latinFont: s.latin_font || "", export: true });
+          renderGroups();
+          selectGroup(s.group);
+        }
+        $("steps").value = String(s.steps);
+        $("seed").value = String(s.seed);
+        $("content-font").value = s.content_font;
+        state.secPerGlyph = per / Math.max((s.refs || [1]).length, 1);
         updateEstimate();
         $("run-card").scrollIntoView({ behavior: "smooth" });
       });
       wrap.append(useBtn);
       if (state.secPerGlyph === undefined && per) {
-        state.secPerGlyph = per / Math.max((v.settings.refs || [1]).length, 1);
+        state.secPerGlyph = per / Math.max((s.refs || [1]).length, 1);
         updateEstimate();
       }
     }
@@ -340,20 +428,41 @@ function renderPreviews(p) {
 }
 
 const loadedFaces = new Set();
-function ensureFontFace(family, url) {
-  if (loadedFaces.has(family)) return;
-  loadedFaces.add(family);
-  const face = new FontFace(family, `url(${url})`);
-  face.load().then((f) => document.fonts.add(f)).catch(() => loadedFaces.delete(family));
+function ensureFontFace(family, url, descriptors = {}) {
+  const key = `${family}|${url}`;
+  if (loadedFaces.has(key)) return;
+  loadedFaces.add(key);
+  const face = new FontFace(family, `url(${url})`, descriptors);
+  face.load().then((f) => document.fonts.add(f)).catch(() => loadedFaces.delete(key));
 }
 
-// ---------- 正式生成 ----------
+// ---------- 生成字型包 ----------
 
-function onFamilyInput() {
-  const name = $("family").value.trim().replace(/\s+NC$/i, "");
-  $("family-final").textContent = name ? `${name} NC` : "—";
+function exportedGroups() {
+  return (state.project.groups || []).filter((g) => state.groups[g.id] && state.groups[g.id].export);
 }
-$("family").addEventListener("input", onFamilyInput);
+
+function renderFontList() {
+  const p = state.project;
+  if (!p) return;
+  const list = exportedGroups();
+  const many = p.groups.length > 1;
+  $("font-list").replaceChildren(...(list.length ? list.map((g) => {
+    const conf = state.groups[g.id];
+    const input = el("input", { maxlength: "40", placeholder: "例如 MyHand" });
+    input.value = conf.family;
+    const final = el("strong", {}, ncName(conf.family) || "—");
+    input.addEventListener("input", () => { conf.family = input.value; final.textContent = ncName(input.value) || "—"; });
+    const meta = el("span", { class: "small muted" },
+      `參考字 ${conf.refs.length} 個・${g.analysis.style || ""}・字重 ${g.analysis.weight || "—"}`);
+    const pick = el("button", { type: "button", class: "link" }, "調整參考字");
+    pick.addEventListener("click", () => { selectGroup(g.id); $("refs-card").scrollIntoView({ behavior: "smooth" }); });
+    return el("div", { class: "font-row" },
+      el("label", { class: "grow" }, many ? `${g.name} 的字型名稱` : "字型名稱", input),
+      el("div", { class: "font-meta" }, el("span", { class: "muted" }, "實際名稱：", final), meta, many ? pick : ""));
+  }) : [el("p", { class: "msg error" }, "請在上方勾選至少一組要匯出的字型。")]));
+  updateEstimate();
+}
 
 function selectedPreset() {
   const checked = document.querySelector('input[name="preset"]:checked');
@@ -375,25 +484,32 @@ function charCount() {
 }
 
 function updateEstimate() {
+  if (!state.project || !state.project.groups) return;
   const n = charCount();
-  const refs = Math.max((state.refs || []).length, 1);
-  const text = state.secPerGlyph
-    ? `AI 需生成約 ${n.toLocaleString()} 字（${refs} 個參考字），依試生成速度估計需 ${formatDuration(n * state.secPerGlyph * refs)}（可隨時暫停、之後續跑）。`
-    : `AI 需生成約 ${n.toLocaleString()} 字。先試生成一次，就能估計所需時間。`;
-  $("estimate").textContent = text;
+  const list = exportedGroups();
+  const passes = list.reduce((sum, g) => sum + Math.max(state.groups[g.id].refs.length, 1), 0);
+  const what = `${list.length} 套字型 × 約 ${n.toLocaleString()} 字`;
+  $("estimate").textContent = state.secPerGlyph
+    ? `${what}，依試生成速度估計 AI 需 ${formatDuration(n * state.secPerGlyph * passes)}，另加描圖與打包（可隨時暫停、之後續跑）。`
+    : `${what}。先試生成一次，就能估計所需時間。`;
 }
 
 $("run-btn").addEventListener("click", async () => {
   const p = state.project;
-  const family = $("family").value.trim();
-  if (!family) { alert("請輸入字型名稱"); return; }
+  const list = exportedGroups();
+  if (!list.length) { alert("請至少勾選一組要匯出的字型"); return; }
+  const fonts = [];
+  for (const g of list) {
+    const conf = state.groups[g.id];
+    if (!conf.family.trim()) { alert(`請輸入「${g.name}」的字型名稱`); return; }
+    if (!conf.refs.length) { alert(`「${g.name}」沒有參考字`); return; }
+    fonts.push({ group: g.id, family: conf.family.trim(), refs: conf.refs, latin_font: conf.latinFont });
+  }
   try {
     await api(`/api/projects/${p.id}/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...genSettings(), family, preset: selectedPreset(), custom: $("custom").value, latin: $("latin").checked,
-      }),
+      body: JSON.stringify({ ...shared(), fonts, preset: selectedPreset(), custom: $("custom").value, latin: $("latin").checked }),
     });
     openProject(p.id);
   } catch (err) {
@@ -413,36 +529,66 @@ async function runAction(action) {
   }
 }
 
+const FONT_STATUS = { pending: "等待中", generating: "AI 生成中", generated: "已生成，等待描圖", building: "描圖與輸出中", done: "完成" };
+
 function renderRun(p) {
   const run = p.run;
   const active = run && (run.status === "queued" || run.status === "running");
   $("run-btn").disabled = !!active || !state.ready;
-  $("progress").hidden = !run || run.status === "done";
-  $("done").hidden = !run || run.status !== "done";
-  if (!run) return;
+  if (!run || !run.fonts) {  // 沒有生成紀錄（或舊版格式）
+    $("progress").hidden = true;
+    $("done").hidden = true;
+    return;
+  }
+  $("progress").hidden = run.status === "done";
+  $("done").hidden = run.status !== "done";
 
   const pct = run.total ? (100 * run.done) / run.total : 0;
   $("bar-fill").style.width = `${pct.toFixed(1)}%`;
-  let text = `${runLabel(run)}：${run.done.toLocaleString()} / ${run.total.toLocaleString()} 字（${pct.toFixed(1)}%）`;
-  if (run.status === "running" && run.rate) text += `，剩餘約 ${formatDuration((run.total - run.done) * run.rate)}`;
+  let text = `${runLabel(run)}：AI 生成 ${run.done.toLocaleString()} / ${run.total.toLocaleString()} 字（${pct.toFixed(1)}%）`;
+  if (run.status === "running" && run.rate && run.done < run.total) {
+    text += `，剩餘約 ${formatDuration((run.total - run.done) * run.rate)}`;
+  }
   if (run.message) text += `\n${run.message}`;
-  if (run.skipped && run.skipped.length) text += `\n內容字型缺少 ${run.skipped.length} 字，已略過。`;
   $("progress-text").textContent = text;
   $("progress-text").className = run.status === "error" ? "msg error" : "msg";
+  $("font-status").replaceChildren(...run.fonts.map((f) => {
+    const skipped = f.skipped && f.skipped.length ? `，內容字型缺 ${f.skipped.length} 字已略過` : "";
+    return el("li", {}, `${f.family}：${FONT_STATUS[f.status] || f.status}（${f.done.toLocaleString()} / ${f.total.toLocaleString()}${skipped}）`);
+  }));
   $("cancel-btn").hidden = !active;
   $("resume-btn").hidden = !(run.status === "paused" || run.status === "error");
 
-  if (run.status === "done") {
-    $("download").href = `/api/projects/${p.id}/font`;
-    $("done-note").textContent = `「${run.family}」共 ${run.glyph_count.toLocaleString()} 字。此字型禁止用於商業用途。`;
-    const family = `final-${p.id}-${run.finished}`;
-    ensureFontFace(family, `/api/projects/${p.id}/font?inline=true&v=${run.finished}`);
-    $("tryout-view").style.fontFamily = `"${family}", serif`;
-    renderTryout();
-  }
+  if (run.status === "done") renderDone(p, run);
 }
 
-function renderTryout() { $("tryout-view").textContent = $("tryout").value; }
+function renderDone(p, run) {
+  $("download").href = `/api/projects/${p.id}/package`;
+  $("download").textContent = `下載字型包（${run.package}）`;
+  const totalFiles = run.fonts.reduce((n, f) => n + f.outputs.length * 3, 0);
+  $("done-note").textContent = `${run.fonts.length} 套字型、${totalFiles} 個字型檔。此字型禁止用於商業用途。`;
+  const out = (rel) => `/api/projects/${p.id}/output/${rel.split("/").map(encodeURIComponent).join("/")}`;
+  $("families").replaceChildren(...run.fonts.map((f) => {
+    const css = `fam-${p.id}-${f.group}-${run.finished}`;
+    for (const o of f.outputs) ensureFontFace(css, out(o.files.woff2), { weight: String(o.weight) });
+    const weights = f.outputs.map((o) => `${o.style} ${o.weight}`).join("・");
+    return el("div", { class: "family" },
+      el("h3", {}, f.family),
+      el("p", { class: "small muted" },
+        `${f.glyph_count.toLocaleString()} 字・${weights}${f.latin_font_name ? `・英數字取自 ${f.latin_font_name}` : ""}`),
+      el("a", { href: out(`${f.folder}/樣張.png`), target: "_blank" },
+        el("img", { class: "specimen", src: out(`${f.folder}/樣張.png`), alt: `${f.family} 樣張` })),
+      el("p", { class: "small" }, el("a", { href: out(`${f.folder}/全字表.pdf`), target: "_blank" }, "開啟全字表（PDF）")),
+      ...f.outputs.map((o) => el("div", { class: "tryout-row" },
+        el("span", { class: "small muted" }, `${o.style} ${o.weight}`),
+        el("div", { class: "tryout", style: `font-family: "${css}", serif; font-weight: ${o.weight}` }))));
+  }));
+  renderTryout();
+}
+
+function renderTryout() {
+  document.querySelectorAll("#families .tryout").forEach((n) => { n.textContent = $("tryout").value; });
+}
 $("tryout").addEventListener("input", renderTryout);
 
 // ---------- 輪詢 ----------

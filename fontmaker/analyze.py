@@ -132,15 +132,30 @@ def _describe(value: float, stops: list[tuple[float, str]]) -> str:
     return stops[-1][1]
 
 
-def analyze(seg: Segmentation) -> dict:
-    glyphs = seg.glyphs
+def _subset_ink(seg: Segmentation, ids: list[int]) -> np.ndarray:
+    """只含指定字的墨跡（其他字留白），用來分別估計各組的傾斜與上揚。"""
+    mask = np.zeros_like(seg.ink)
+    for i in ids:
+        g = seg.glyphs[i]
+        mask[g.box.y0 : g.box.y1, g.box.x0 : g.box.x1] |= g.ink
+    return mask
+
+
+def analyze(seg: Segmentation, glyph_ids: list[int] | None = None) -> dict:
+    """分析整張圖，或只分析 glyph_ids 指定的字（一個字型分組）。"""
+    if glyph_ids is None:
+        glyph_ids = list(range(len(seg.glyphs)))
+    id_set = set(glyph_ids)
+    glyphs = [seg.glyphs[i] for i in glyph_ids]
+    lines = [[i for i in ids if i in id_set] for ids in seg.lines]
+    lines = [ids for ids in lines if ids]
     if not glyphs:
         return {"ok": False, "message": "圖片中找不到文字，請換一張對比較清楚的圖片。"}
 
     # 只用接近完整字大小的字（排除標點等小符號）
     full = [g for g in glyphs if max(g.box.w, g.box.h) >= 0.7 * g.line_height]
     good = [g for g in full if g.score >= 0.5] or full or glyphs
-    strokes, contrasts, rounds, ratios = [], [], [], []
+    strokes, contrasts, rounds, ratios, horizontals = [], [], [], [], []
     for g in good:
         sw = _stroke_width(g.ink)
         strokes.append(sw / (g.line_height / FILL_RATIO))
@@ -148,6 +163,10 @@ def analyze(seg: Segmentation) -> dict:
         c = _contrast(g.ink)
         if c is not None:
             contrasts.append(c)
+        v = _runs(g.ink, 0)
+        v = v[v >= 2]
+        if len(v) >= 10:  # 橫畫粗細（佔字身比例）
+            horizontals.append(float(np.percentile(v, 25)) / (g.line_height / FILL_RATIO))
         r = _roundness(g.ink, sw, seg.blur)
         if r is not None:
             rounds.append(r)
@@ -155,17 +174,19 @@ def analyze(seg: Segmentation) -> dict:
     stroke_em = float(np.median(strokes))
     stroke_cv = float(np.std(strokes) / max(np.mean(strokes), 1e-6))
     contrast = float(np.median(contrasts)) if contrasts else 1.0
+    horizontal = float(np.median(horizontals)) if horizontals else 1.0
     roundness = float(np.median(rounds)) if rounds else None
     aspect = float(np.median(ratios))
 
-    slant = _slant(seg.ink)
-    rise = _rise(seg.ink)
+    ink = _subset_ink(seg, glyph_ids)
+    slant = _slant(ink)
+    rise = _rise(ink)
     glyph_px = float(np.median([g.box.h for g in good]))
 
     # 工整度：方塊字底線的起伏 + 筆畫粗細的變異
     jitter = []
-    for ids in seg.lines:
-        bottoms = [glyphs[i].box.y1 / glyphs[i].line_height for i in ids if glyphs[i] in good]
+    for ids in lines:
+        bottoms = [seg.glyphs[i].box.y1 / seg.glyphs[i].line_height for i in ids if seg.glyphs[i] in good]
         if len(bottoms) >= 3:
             jitter.append(float(np.std(bottoms)))
     baseline_jitter = float(np.median(jitter)) if jitter else 0.0
@@ -180,7 +201,7 @@ def analyze(seg: Segmentation) -> dict:
     if latin_heavy:
         if irregularity > 0.45 or abs(slant) > 8:
             style, style_note = "手寫／草寫風格（英文）", "以英文字母判斷：字形不規則或明顯傾斜。"
-        elif contrast > 1.4:
+        elif contrast > 1.4 and horizontal < 0.048:  # 明體：橫畫明顯比直畫細，而且橫畫本身就很細
             style, style_note = "襯線風格（英文）", "以英文字母判斷：直粗橫細，接近襯線（Serif）字型。"
         else:
             style, style_note = "無襯線風格（英文）", "以英文字母判斷：筆畫粗細均勻，接近無襯線（Sans）字型。"
@@ -190,7 +211,7 @@ def analyze(seg: Segmentation) -> dict:
     elif rise > 0.035:
         style = "楷書風格"
         style_note = "橫畫向右上揚、筆畫有提按變化，接近楷書或手寫。"
-    elif contrast > 1.4:
+    elif contrast > 1.4 and horizontal < 0.048:  # 明體：橫畫明顯比直畫細，而且橫畫本身就很細
         style = "明體／宋體風格"
         style_note = "橫細直粗、粗細對比明顯。"
     elif roundness is not None and roundness > (0.65 if seg.blur > BLURRY else 0.4):
@@ -229,7 +250,7 @@ def analyze(seg: Segmentation) -> dict:
         "warnings": warnings,
         "glyph_px": round(glyph_px),
         "glyph_count": len(glyphs),
-        "line_count": len(seg.lines),
+        "line_count": len(lines),
         "inverted": seg.inverted,
         "style": style,
         "style_note": style_note,
@@ -238,3 +259,87 @@ def analyze(seg: Segmentation) -> dict:
         "slant": slant,
         "features": features,
     }
+
+
+def _line_features(seg: Segmentation, ids: list[int]) -> dict | None:
+    full = [seg.glyphs[i] for i in ids if max(seg.glyphs[i].box.w, seg.glyphs[i].box.h) >= 0.7 * seg.glyphs[i].line_height]
+    if not full:
+        return None
+    height = float(np.median([g.box.h for g in full]))
+    strokes = [_stroke_width(g.ink) / max(g.box.h, 1) for g in full]
+    contrasts = [c for c in (_contrast(g.ink) for g in full) if c is not None]
+    return {
+        "height": height,
+        "stroke": float(np.median(strokes)),
+        "contrast": float(np.median(contrasts)) if contrasts else 1.2,
+        "rise": _rise(_subset_ink(seg, [g.index for g in full])),
+        "y": float(np.mean([g.box.cy for g in full])),
+    }
+
+
+def _same_font(a: dict, b: dict) -> bool:
+    ratio = lambda x, y: max(x, y) / max(min(x, y), 1e-6)  # noqa: E731
+    return (ratio(a["height"], b["height"]) <= 1.3
+            and ratio(a["stroke"], b["stroke"]) <= 1.3
+            and abs(a["contrast"] - b["contrast"]) <= 0.35
+            and abs(a["rise"] - b["rise"]) <= 0.03)
+
+
+def group_glyphs(seg: Segmentation) -> list[list[int]]:
+    """把圖中的字依字型分組：同一行視為同一字型，字高、筆畫粗細比例、粗細對比、橫畫上揚都相近的行歸成一組。
+
+    只有標點等小符號的行，併到上下最近的一組。回傳各組的字索引，依在圖中由上到下排序。
+    """
+    feats = [(ids, _line_features(seg, ids)) for ids in seg.lines if ids]
+    real = [(ids, f) for ids, f in feats if f is not None]
+    if not real:
+        return [list(range(len(seg.glyphs)))] if seg.glyphs else []
+
+    parent = list(range(len(real)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(real)):
+        for j in range(i + 1, len(real)):
+            if _same_font(real[i][1], real[j][1]):
+                parent[find(j)] = find(i)
+
+    groups: dict[int, list[int]] = {}
+    centers: dict[int, list[float]] = {}
+    for k, (ids, f) in enumerate(real):
+        groups.setdefault(find(k), []).extend(ids)
+        centers.setdefault(find(k), []).append(f["y"])
+    for ids, f in feats:
+        if f is None:  # 只有小符號的行：併到最近的一組
+            y = float(np.mean([seg.glyphs[i].box.cy for i in ids]))
+            nearest = min(centers, key=lambda r: min(abs(c - y) for c in centers[r]))
+            groups[nearest].extend(ids)
+    ordered = sorted(groups.values(), key=lambda ids: min(seg.glyphs[i].box.y0 for i in ids))
+    return [sorted(ids) for ids in ordered]
+
+
+def stroke_for_weight(weight: float) -> float:
+    """字重 → 典型筆畫粗細（字身比例），WEIGHT_STOPS 的反查。"""
+    strokes, weights = WEIGHT_STOPS
+    return float(np.interp(weight, weights, strokes))
+
+
+def weight_variants(base: int) -> list[tuple[str, int]]:
+    """由分析出的字重衍生一組字重（常見組合，例如 400 → Light 300／Regular 400／Bold 700）。
+
+    筆畫加粗或變細太多形狀會崩，所以把粗細倍率限制在 0.55–1.9 倍之間。
+    """
+    base = int(np.clip(round(base / 100) * 100, 100, 900))
+    lighter = base - (100 if base <= 400 else 200)
+    heavier = base + (300 if base <= 400 else 200)
+    ref = stroke_for_weight(base)
+    while lighter < base and stroke_for_weight(lighter) / ref < 0.55:
+        lighter += 100
+    while heavier > base and stroke_for_weight(heavier) / ref > 1.9:
+        heavier -= 100
+    weights = sorted({int(np.clip(w, 100, 900)) for w in (lighter, base, heavier)})
+    return [(WEIGHT_NAMES[w], w) for w in weights]

@@ -25,6 +25,7 @@ except ImportError:
 
 
 class PreviewRequest(BaseModel):
+    group: str = ""
     refs: list[int] = Field(..., min_length=1, max_length=jobs.MAX_REFS)
     content_font: str
     latin_font: str = ""
@@ -33,14 +34,19 @@ class PreviewRequest(BaseModel):
     text: str = Field(jobs.PREVIEW_TEXT, max_length=40)
 
 
-class RunRequest(BaseModel):
+class FontRequest(BaseModel):
+    group: str
     family: str = Field(..., min_length=1, max_length=40)
+    refs: list[int] = Field(..., min_length=1, max_length=jobs.MAX_REFS)
+    latin_font: str = ""
+
+
+class RunRequest(BaseModel):
+    fonts: list[FontRequest] = Field(..., min_length=1, max_length=10)
     preset: str = "common"
     custom: str = Field("", max_length=20000)
     latin: bool = True
-    refs: list[int] = Field(..., min_length=1, max_length=jobs.MAX_REFS)
     content_font: str
-    latin_font: str = ""
     steps: int = Field(20, ge=5, le=50)
     seed: int = 123
 
@@ -58,20 +64,24 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
 
     scanner = manager.scanner
 
-    def check_inputs(p: jobs.Project, req) -> None:
+    def check_common(content_font: str) -> None:
         if require_setup:
             problems = generator.check_setup()
             if problems:
                 raise HTTPException(409, "\n".join(problems))
         if not scanner.ready.is_set():
             raise HTTPException(409, "還在掃描字型，請稍候再試")
-        if req.content_font not in {f.id for f in scanner.content_fonts()}:
+        if content_font not in {f.id for f in scanner.content_fonts()}:
             raise HTTPException(400, "請先選擇內容字型")
-        if req.latin_font and req.latin_font not in {f.id for f in scanner.latin_fonts()}:
+
+    def check_font(p: jobs.Project, group: str, refs: list[int], latin_font: str) -> None:
+        if group and group not in {g["id"] for g in p.data["groups"]}:
+            raise HTTPException(400, "字型分組不存在")
+        if latin_font and latin_font not in {f.id for f in scanner.latin_fonts()}:
             raise HTTPException(400, "英數字字型不存在")
-        if len(set(req.refs)) != len(req.refs):
+        if len(set(refs)) != len(refs):
             raise HTTPException(400, "參考字重複")
-        for ref in req.refs:
+        for ref in refs:
             if not (p.root / "refs" / f"{ref}.png").is_file():
                 raise HTTPException(400, "參考字不存在")
 
@@ -135,17 +145,19 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
         return FileResponse(path)
 
     @app.get("/api/projects/{pid}/latin")
-    def latin_candidates(pid: str):
+    def latin_candidates(pid: str, group: str = ""):
         p = project_or_404(pid)
-        if not p.data["analysis"].get("ok") or not scanner.latin_ready.is_set():
+        analysis = p.group(group)["analysis"]
+        if not analysis.get("ok") or not scanner.latin_ready.is_set():
             return {"ready": scanner.latin_ready.is_set(), "candidates": []}
         return {"ready": True, "candidates": [{"id": f.id, "label": f.label, "distance": round(d, 3)}
-                                              for f, d in manager.latin_candidates(p)]}
+                                              for f, d in manager.latin_candidates(analysis)]}
 
     @app.post("/api/projects/{pid}/preview")
     def preview(pid: str, req: PreviewRequest):
         p = project_or_404(pid)
-        check_inputs(p, req)
+        check_common(req.content_font)
+        check_font(p, req.group, req.refs, req.latin_font)
         return {"id": manager.submit_preview(p, req.model_dump())}
 
     @app.get("/api/projects/{pid}/previews/{preview_id}/{name}")
@@ -160,7 +172,9 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
     @app.post("/api/projects/{pid}/run")
     def run(pid: str, req: RunRequest):
         p = project_or_404(pid)
-        check_inputs(p, req)
+        check_common(req.content_font)
+        for f in req.fonts:
+            check_font(p, f.group, f.refs, f.latin_font)
         if req.preset not in charsets.PRESETS:
             raise HTTPException(400, "未知的字集")
         try:
@@ -184,16 +198,23 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
             raise HTTPException(409, str(exc))
         return p.data["run"]
 
-    @app.get("/api/projects/{pid}/font")
-    def download(pid: str, inline: bool = False):
+    @app.get("/api/projects/{pid}/package")
+    def download_package(pid: str):
         p = project_or_404(pid)
         run = p.data.get("run") or {}
-        if run.get("status") != "done" or not run.get("output"):
-            raise HTTPException(404, "字型尚未完成")
-        path = p.root / "output" / run["output"]
-        if inline:
-            return FileResponse(path, media_type="font/ttf")
-        return FileResponse(path, media_type="font/ttf", filename=run["output"])
+        path = p.root / run["package"] if run.get("status") == "done" and run.get("package") else None
+        if path is None or not path.is_file():
+            raise HTTPException(404, "字型包尚未完成")
+        return FileResponse(path, media_type="application/zip", filename=path.name)
+
+    @app.get("/api/projects/{pid}/output/{rel:path}")
+    def output_file(pid: str, rel: str):
+        """字型包中的單一檔案（網頁試打、看樣張用）。"""
+        root = (project_or_404(pid).root / "output").resolve()
+        path = (root / rel).resolve()
+        if root not in path.parents or not path.is_file():
+            raise HTTPException(404)
+        return FileResponse(path)
 
     @app.get("/favicon.ico")
     def favicon():

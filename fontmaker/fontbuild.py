@@ -1,4 +1,4 @@
-"""把描好的輪廓組成 TrueType 字型檔。
+"""把描好的輪廓組成字型檔（TTF、OTF、WOFF2）。
 
 非商業用途標記：字型家族名稱一律帶「NC」字尾（例如「MyHand NC」），程式不提供移除選項。
 """
@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fontTools.fontBuilder import FontBuilder
+from fontTools.misc.timeTools import timestampNow
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 
 from . import vectorize
@@ -57,6 +58,7 @@ class GlyphSource:
 class FontSpec:
     family: str
     weight: int = 400
+    style: str = "Regular"
     italic_angle: float = 0.0
     space_advance: float = 0.25
     glyphs: list[GlyphSource] = field(default_factory=list)
@@ -102,13 +104,42 @@ def trace_all(sources: list[GlyphSource], progress=None) -> list:
     return [results.get(i, src.contours) for i, src in enumerate(sources)]
 
 
-def build_font(spec: FontSpec, out_path: str | Path, progress=None) -> dict:
-    """progress(已完成, 總數)：描圖很花時間，定期回報進度。"""
+def style_names(family: str, style: str) -> dict:
+    """依字重名稱產生名稱表。Regular／Bold 走傳統的四種樣式連結，其他字重另成子家族，並附上排版用家族名稱。"""
+    ps_style = style.replace(" ", "")
+    if style in ("Regular", "Bold"):
+        legacy_family, legacy_style = family, style
+    else:
+        legacy_family, legacy_style = f"{family} {style}", "Regular"
+    full = family if style == "Regular" else f"{family} {style}"
+    names = {
+        "familyName": legacy_family,
+        "styleName": legacy_style,
+        "uniqueFontIdentifier": f"{_ps_name(family)}-{ps_style}",
+        "fullName": full,
+        "psName": f"{_ps_name(family)}-{ps_style}",
+        "version": "Version 1.000",
+    }
+    if legacy_family != family or legacy_style != style:
+        names["typographicFamily"] = family
+        names["typographicSubfamily"] = style
+    return names
+
+
+def build_font(spec: FontSpec, out_path: str | Path, progress=None, formats=("ttf",)) -> dict:
+    """組字型檔。out_path 為 .ttf 路徑，其他格式（otf、woff2）放在同一資料夾、同一檔名。
+
+    progress(已完成, 總數)：描圖很花時間，定期回報進度。
+    """
+    from fontTools.pens.reverseContourPen import ReverseContourPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+
     family = nc_family_name(spec.family)
+    style = spec.style or "Regular"
     order = [".notdef", "space", "uni3000"]
     cmap = {0x20: "space", 0x3000: "uni3000"}
-    glyf = {".notdef": _notdef(), "space": TTGlyphPen(None).glyph(), "uni3000": TTGlyphPen(None).glyph()}
-    metrics = {".notdef": (UPM, 100), "space": (round(spec.space_advance * UPM), 0), "uni3000": (UPM, 0)}
+    placed: dict[str, tuple] = {}  # name → (輪廓, dx, dy)
+    metrics = {".notdef": UPM, "space": round(spec.space_advance * UPM), "uni3000": UPM}
     empty = []
 
     traced = trace_all(spec.glyphs, progress)
@@ -134,42 +165,98 @@ def build_font(spec: FontSpec, out_path: str | Path, progress=None) -> dict:
             # 半形字：依生成後的實際字寬重算字距，左右留白沿用內容字型
             dx = p.lsb * UPM - span[0]
             advance = round(p.lsb * UPM + (span[1] - span[0]) + p.rsb * UPM)
+        placed[name] = (contours, dx, dy)
+        order.append(name)
+        cmap[cp] = name
+        metrics[name] = max(advance, 1)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    names = style_names(family, style)
+    bold = style == "Bold"
+    fs_selection = (1 << 5) if bold else ((1 << 6) if style == "Regular" else 0)
+    files = {}
+
+    def common(fb: FontBuilder) -> None:
+        fb.setupHorizontalHeader(ascent=ASCENT, descent=DESCENT)
+        fb.setupNameTable(names)
+        fb.setupOS2(
+            usWeightClass=spec.weight, fsSelection=fs_selection,
+            sTypoAscender=ASCENT, sTypoDescender=DESCENT, sTypoLineGap=0,
+            usWinAscent=ASCENT, usWinDescent=-DESCENT,
+            ulCodePageRange1=(1 << 0) | (1 << 20),  # Latin 1、繁體中文 Big5
+        )
+        fb.setupPost(italicAngle=-abs(spec.italic_angle) if spec.italic_angle > 3 else 0)
+        now = timestampNow()
+        fb.setupHead(unitsPerEm=UPM, macStyle=1 if bold else 0, created=now, modified=now)
+
+    def cff_lsb(name: str) -> int:
+        """CFF 字形的左側間距 = 三次曲線輪廓的精確最小 x（直接由輪廓計算，不經 glyph set）。"""
+        if name not in placed:
+            return 100 if name == ".notdef" else 0
+        from fontTools.pens.boundsPen import BoundsPen
+
+        contours, dx, dy = placed[name]
+        bp = BoundsPen(None)
+        vectorize.draw_cubic(contours, bp, dx, dy)
+        return round(bp.bounds[0]) if bp.bounds else 0
+
+    # TrueType（二次曲線）
+    glyf = {".notdef": _notdef(), "space": TTGlyphPen(None).glyph(), "uni3000": TTGlyphPen(None).glyph()}
+    for name, (contours, dx, dy) in placed.items():
         pen = TTGlyphPen(None)
         vectorize.draw(contours, pen, dx, dy)
         glyf[name] = pen.glyph(dropImpliedOnCurves=True)
-        order.append(name)
-        cmap[cp] = name
-        metrics[name] = (max(advance, 1), 0)
-
     fb = FontBuilder(UPM, isTTF=True)
     fb.setupGlyphOrder(order)
     fb.setupCharacterMap(cmap)
     fb.setupGlyf(glyf)
     glyph_table = fb.font["glyf"]
     hmtx = {}
-    for name in order:
+    for name in order:  # 左側間距必須等於 glyf 的 xMin，否則渲染時字會位移
         g = glyph_table[name]
         g.recalcBounds(glyph_table)
-        hmtx[name] = (metrics[name][0], getattr(g, "xMin", 0))
+        hmtx[name] = (metrics[name], getattr(g, "xMin", 0))
     fb.setupHorizontalMetrics(hmtx)
-    fb.setupHorizontalHeader(ascent=ASCENT, descent=DESCENT)
-    fb.setupNameTable({
-        "familyName": family,
-        "styleName": "Regular",
-        "uniqueFontIdentifier": f"{_ps_name(family)}-Regular",
-        "fullName": family,
-        "psName": f"{_ps_name(family)}-Regular",
-        "version": "Version 1.000",
-    })
-    fb.setupOS2(
-        usWeightClass=spec.weight,
-        sTypoAscender=ASCENT, sTypoDescender=DESCENT, sTypoLineGap=0,
-        usWinAscent=ASCENT, usWinDescent=-DESCENT,
-        ulCodePageRange1=(1 << 0) | (1 << 20),  # Latin 1、繁體中文 Big5
-    )
-    fb.setupPost(italicAngle=-abs(spec.italic_angle) if spec.italic_angle > 3 else 0)
-    fb.setupHead(unitsPerEm=UPM)
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    common(fb)
     fb.save(str(out_path))
-    return {"family": family, "glyphs": len(order) - 3, "empty": empty, "path": str(out_path)}
+    files["ttf"] = str(out_path)
+
+    if "otf" in formats:
+        # OpenType／CFF（三次曲線，potrace 原始輸出不需轉換；CFF 外框方向與 TrueType 相反）
+        charstrings = {}
+        for name in order:
+            pen = T2CharStringPen(metrics[name], None)
+            if name == ".notdef":
+                for pts in ([(100, 0), (900, 0), (900, 800), (100, 800)], [(150, 50), (150, 750), (850, 750), (850, 50)]):
+                    pen.moveTo(pts[0])
+                    for pt in pts[1:]:
+                        pen.lineTo(pt)
+                    pen.closePath()
+            elif name in placed:
+                contours, dx, dy = placed[name]
+                vectorize.draw_cubic(contours, ReverseContourPen(pen), dx, dy)
+            charstrings[name] = pen.getCharString()
+        fb = FontBuilder(UPM, isTTF=False)
+        fb.setupGlyphOrder(order)
+        fb.setupCharacterMap(cmap)
+        # CFF 內部名稱只能用 Latin-1，中文名稱放在 name 表（系統顯示用的是 name 表）
+        fb.setupCFF(names["psName"], {"FullName": names["psName"], "FamilyName": _ps_name(family), "Weight": style},
+                    charstrings, {})
+        fb.setupHorizontalMetrics({name: (metrics[name], cff_lsb(name)) for name in order})
+        common(fb)
+        otf = out_path.with_suffix(".otf")
+        fb.save(str(otf))
+        files["otf"] = str(otf)
+
+    if "woff2" in formats:
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(str(out_path))
+        font.flavor = "woff2"
+        woff2 = out_path.with_suffix(".woff2")
+        font.save(str(woff2))
+        files["woff2"] = str(woff2)
+
+    return {"family": family, "style": style, "weight": spec.weight, "glyphs": len(order) - 3,
+            "empty": empty, "path": str(out_path), "files": files}

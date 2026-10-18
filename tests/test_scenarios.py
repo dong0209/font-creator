@@ -173,3 +173,92 @@ def test_restart_marks_running_preview_as_interrupted(tmp_path, fonts_dir, cjk_f
     time.sleep(0.5)
     m2 = jobs.Manager(work_dir=tmp_path / "w", generator_factory=lambda s: Slow(), scanner=m1.scanner)
     assert m2.get(p.id).data["previews"][0]["status"] == "error"
+
+
+# ---------- 字型分組與字型包 ----------
+
+def _poster(rows):
+    h = sum(int(size * 1.6) for _, _, size in rows) + 80
+    img = Image.new("L", (1000, h), 255)
+    d = ImageDraw.Draw(img)
+    y = 40
+    for text, font, size in rows:
+        d.text((40, y), text, font=ImageFont.truetype(str(font), size), fill=0)
+        y += int(size * 1.6)
+    return img.convert("RGB")
+
+
+def test_grouping_by_size_and_style(cjk_font_path):
+    same = _poster([("永和九年歲在癸丑", cjk_font_path, 70), ("暮春之初會於會稽", cjk_font_path, 70),
+                    ("山陰之蘭亭修禊事", cjk_font_path, 70)])
+    seg = segment.segment(same)
+    assert len(analyze.group_glyphs(seg)) == 1
+    title = _poster([("蘭亭集序", cjk_font_path, 130), ("永和九年歲在癸丑暮春之初", cjk_font_path, 60),
+                     ("會於會稽山陰之蘭亭修禊事", cjk_font_path, 60)])
+    seg = segment.segment(title)
+    groups = analyze.group_glyphs(seg)
+    assert [len(g) for g in groups] == [4, 24]
+    assert analyze.analyze(seg, groups[0])["glyph_count"] == 4
+
+
+@pytest.mark.parametrize("base", [100, 300, 400, 500, 700, 900])
+def test_weight_variants_stay_in_range(base):
+    variants = analyze.weight_variants(base)
+    assert any(w == round(base / 100) * 100 for _, w in variants)
+    ref = analyze.stroke_for_weight(base)
+    for _, w in variants:
+        assert 0.5 <= analyze.stroke_for_weight(w) / ref <= 2.0
+
+
+def test_package_has_all_weights_formats_and_specimens(tmp_path, fonts_dir, cjk_font_path):
+    import zipfile
+
+    from fontTools.ttLib import TTFont
+
+    manager = jobs.Manager(work_dir=tmp_path / "work", generator_factory=lambda s: FakeGenerator())
+    manager.scanner.ready.wait(60)
+    c = TestClient(create_app(manager, require_setup=False))
+    poster = _poster([("蘭亭集序", cjk_font_path, 130), ("永和九年歲在癸丑暮春之初", cjk_font_path, 60),
+                      ("會於會稽山陰之蘭亭修禊事", cjk_font_path, 60)])
+    p = c.post("/api/projects", files={"file": ("p.png", _encode(poster, "PNG"), "image/png")}).json()
+    assert len(p["groups"]) == 2
+    content = f"{fonts_dir / cjk_font_path.name}#0"
+    fonts = [{"group": g["id"], "family": name, "refs": [g["default_ref"]]}
+             for g, name in zip(p["groups"], ["Title", "內文"])]
+    body = {"fonts": fonts, "preset": "custom", "custom": "我愛你", "latin": True, "content_font": content, "steps": 10}
+
+    dup = c.post(f"/api/projects/{p['id']}/run", json={**body, "fonts": [fonts[0], {**fonts[1], "family": "Title"}]})
+    assert dup.status_code == 409  # 名稱重複
+
+    assert c.post(f"/api/projects/{p['id']}/run", json=body).status_code == 200
+    end = time.time() + 300
+    while time.time() < end:
+        run = c.get(f"/api/projects/{p['id']}").json()["run"]
+        if run["status"] in ("done", "error"):
+            break
+        time.sleep(0.3)
+    assert run["status"] == "done", run
+    zip_bytes = c.get(f"/api/projects/{p['id']}/package").content
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        for family in ("Title NC", "內文 NC"):
+            entry = next(f for f in run["fonts"] if f["family"] == family)
+            assert len(entry["outputs"]) >= 2
+            for fmt in ("TTF", "OTF", "WOFF2"):
+                assert sum(n.startswith(f"{family}/{fmt}/") for n in names) == len(entry["outputs"])
+            for extra in ("fonts.css", "樣張.png", "全字表.pdf"):
+                assert f"{family}/{extra}" in names
+            # 各字重的 usWeightClass 與家族名稱
+            weights = []
+            for n in names:
+                if n.startswith(f"{family}/OTF/"):
+                    f = TTFont(io.BytesIO(zf.read(n)))
+                    weights.append(f["OS/2"].usWeightClass)
+                    typo = f["name"].getDebugName(16) or f["name"].getDebugName(1)
+                    assert typo == family
+                    assert "CFF " in f
+            assert sorted(weights) == sorted(o["weight"] for o in entry["outputs"])
+    # 試打用的單一檔案
+    first = run["fonts"][0]["outputs"][0]["files"]["woff2"]
+    assert c.get(f"/api/projects/{p['id']}/output/{first}").status_code == 200
+    assert c.get(f"/api/projects/{p['id']}/output/../project.json").status_code == 404

@@ -162,23 +162,29 @@ def test_api_end_to_end(tmp_path, fonts_dir, cjk_font_path):
     assert client.get(f"/api/projects/{pid}/previews/{preview['id']}/preview.ttf").status_code == 200
     assert client.get(f"/api/projects/{pid}/previews/{preview['id']}/{ord('永'):X}.png").status_code == 200
 
-    body = {"family": "測試 Hand", "preset": "custom", "custom": "我愛你", "latin": True,
-            "refs": refs, "content_font": content_id, "steps": 10}
+    group = project["groups"][0]["id"]
+    body = {"fonts": [{"group": group, "family": "測試 Hand", "refs": refs}], "preset": "custom",
+            "custom": "我愛你", "latin": True, "content_font": content_id, "steps": 10}
     res = client.post(f"/api/projects/{pid}/run", json=body)
     assert res.status_code == 200, res.text
     data = _wait(client, pid, lambda d: d["run"]["status"] in ("done", "error"))
     run = data["run"]
     assert run["status"] == "done", run
-    assert run["family"] == "測試 Hand NC"
+    assert run["fonts"][0]["family"] == "測試 Hand NC"
     assert run["total"] < 100  # 英數字不經 AI 生成
 
-    res = client.get(f"/api/projects/{pid}/font")
+    res = client.get(f"/api/projects/{pid}/package")
     assert res.status_code == 200
-    font = TTFont(io.BytesIO(res.content))
+    import zipfile
+    with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+        names = zf.namelist()
+        ttf = next(n for n in names if n.endswith(".ttf"))
+        font = TTFont(io.BytesIO(zf.read(ttf)))
     cmap = font.getBestCmap()
     for ch in "我愛你，。AZaz09!~":
         assert ord(ch) in cmap, ch
-    assert font["name"].getDebugName(1) == "測試 Hand NC"
+    assert font["name"].getDebugName(16) in ("測試 Hand NC", None)
+    assert "測試 Hand NC" in font["name"].getDebugName(1)
     a_bounds = _glyph_bounds(font, "A")
     assert a_bounds[1] > -20 and 500 < a_bounds[3] < 900  # A 站在基線上、高度合理
 
@@ -200,9 +206,9 @@ def test_pause_and_resume(tmp_path, fonts_dir, cjk_font_path):
 
     manager = jobs.Manager(work_dir=tmp_path / "work", generator_factory=lambda steps: SlowFake())
     p = manager.create(draw_text(cjk_font_path, ["永東國"]), "x.png")
-    settings = {"family": "P", "preset": "custom", "custom": "一二三四五六七八九十", "latin": False,
-                "refs": [p.data["default_ref"]], "content_font": _content_id(manager, fonts_dir, cjk_font_path),
-                "steps": 10, "seed": 1}
+    settings = {"fonts": [{"group": p.data["groups"][0]["id"], "family": "P", "refs": [p.data["default_ref"]]}],
+                "preset": "custom", "custom": "一二三四五六七八九十", "latin": False,
+                "content_font": _content_id(manager, fonts_dir, cjk_font_path), "steps": 10, "seed": 1}
     manager.submit_run(p, settings)
     end = time.time() + 30
     while p.data["run"]["status"] != "running" and time.time() < end:
@@ -221,7 +227,7 @@ def test_pause_and_resume(tmp_path, fonts_dir, cjk_font_path):
     while p2.data["run"]["status"] != "done" and time.time() < end + 30:
         time.sleep(0.1)
     assert p2.data["run"]["status"] == "done"
-    assert p2.data["run"]["glyph_count"] >= 10
+    assert p2.data["run"]["fonts"][0]["glyph_count"] >= 10
 
 
 def test_roundness_separates_square_and_rounded(cjk_font_path):
@@ -240,3 +246,29 @@ def test_roundness_separates_square_and_rounded(cjk_font_path):
         rounded.append(analyze._roundness(soft, sw))
     assert np.median(square) < 0.3
     assert np.median(rounded) > 0.6
+
+
+def test_all_formats_place_glyphs_identically(tmp_path, cjk_font_path):
+    """TTF／OTF／WOFF2 中同一個字的位置要一致（左側間距必須等於實際外框，否則渲染時會位移）。"""
+    cf = ContentFont(cjk_font_path)
+    sources = []
+    for ch in "國永A":
+        img, placement = cf.render(ch)
+        sources.append(fontbuild.GlyphSource(ch, img.resize((96, 96)), placement))
+    info = fontbuild.build_font(fontbuild.FontSpec(family="Fmt", glyphs=sources), tmp_path / "f.ttf",
+                                formats=("ttf", "otf", "woff2"))
+    bounds = {}
+    for fmt, path in info["files"].items():
+        font = TTFont(path)
+        bounds[fmt] = {ch: _glyph_bounds(font, ch) for ch in "國永A"}
+        for name, (_, lsb) in font["hmtx"].metrics.items():
+            gs = font.getGlyphSet()
+            pen = BoundsPen(gs)
+            gs[name].draw(pen)
+            if pen.bounds:
+                assert abs(pen.bounds[0] - lsb) <= 1, (fmt, name, pen.bounds, lsb)
+    for ch in "國永A":
+        for fmt in ("otf", "woff2"):
+            assert all(abs(a - b) <= 3 for a, b in zip(bounds["ttf"][ch], bounds[fmt][ch])), (ch, fmt, bounds)
+    g = bounds["otf"]["國"]
+    assert abs((g[0] + g[2]) / 2 - 500) < 30

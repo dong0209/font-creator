@@ -39,6 +39,10 @@
       <div class="analysis-grid">
         <div class="source-wrap"><img id="source" alt="上傳的圖片"><svg id="boxes"></svg></div>
         <div>
+          <div id="groups-wrap" hidden>
+            <p class="small muted">圖中辨識出 <strong id="group-count"></strong> 種字型。勾選要匯出的字型，點卡片查看該組的分析與參考字。</p>
+            <div id="groups" class="groups"></div>
+          </div>
           <p class="style-guess"><span id="style-name"></span><span id="weight-name" class="pill"></span></p>
           <p id="style-note" class="muted"></p>
           <table class="features"><tbody id="features"></tbody></table>
@@ -49,12 +53,12 @@
     </section>
 
     <section id="refs-card" class="card" hidden>
-      <h2><span class="step">3</span>選擇風格參考字並試生成</h2>
+      <h2><span class="step">3</span>選擇風格參考字並試生成<span id="refs-group" class="pill"></span></h2>
       <p class="muted">AI 會模仿參考字的風格來生成所有字。筆畫多、方正、清楚的中文字效果最好（已依適合程度排序）。點選可多選（最多 3 個）。</p>
       <div id="refs" class="refs"></div>
       <p id="refs-count" class="small muted"></p>
       <div class="row">
-        <label class="grow">內容字型（中文字骨架） <select id="content-font"></select></label>
+        <label class="grow">內容字型（中文字骨架，所有字型共用） <select id="content-font"></select></label>
         <label class="grow">英數字字型 <select id="latin-font"><option value="">自動（最接近的字型）</option></select></label>
       </div>
       <p id="content-hint" class="small muted"></p>
@@ -75,11 +79,9 @@
     </section>
 
     <section id="run-card" class="card" hidden>
-      <h2><span class="step">4</span>生成完整字型</h2>
-      <div class="row">
-        <label class="grow">字型名稱 <input id="family" maxlength="40" placeholder="例如 MyHand"></label>
-        <span class="muted">實際名稱：<strong id="family-final">—</strong></span>
-      </div>
+      <h2><span class="step">4</span>生成字型包</h2>
+      <p class="muted small">每套字型會輸出 3 種字重（依分析結果衍生）、TTF／OTF／WOFF2 三種格式、網頁用 CSS、樣張與全字表，打包成一個 zip。</p>
+      <div id="font-list" class="font-list"></div>
       <div class="row presets" id="presets"></div>
       <label id="custom-wrap" hidden>自訂字表（直接貼上要的字）<textarea id="custom" rows="3"></textarea></label>
       <label class="check"><input id="latin" type="checkbox" checked> 包含英文、數字與符號</label>
@@ -91,6 +93,7 @@
       <div id="progress" hidden>
         <div class="bar"><div id="bar-fill"></div></div>
         <p id="progress-text"></p>
+        <ul id="font-status" class="font-status"></ul>
         <div class="row">
           <button id="cancel-btn">暫停</button>
           <button id="resume-btn" hidden>繼續</button>
@@ -98,10 +101,10 @@
       </div>
 
       <div id="done" hidden>
-        <p><a id="download" class="button primary" href="#">下載字型檔（.ttf）</a></p>
+        <p><a id="download" class="button primary" href="#">下載字型包（.zip）</a></p>
         <p id="done-note" class="muted small"></p>
-        <label>試打文字<textarea id="tryout" rows="3">永和九年，歲在癸丑。The quick brown fox 0123456789</textarea></label>
-        <div id="tryout-view" class="tryout"></div>
+        <label>試打文字（下方各字重即時顯示）<textarea id="tryout" rows="2">永和九年，歲在癸丑。The quick brown fox 0123456789</textarea></label>
+        <div id="families"></div>
       </div>
     </section>
   </main>

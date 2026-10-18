@@ -193,6 +193,19 @@ def draw(contours, pen, dx: float = 0.0, dy: float = 0.0) -> None:
         qpen.closePath()
 
 
+def draw_cubic(contours, pen, dx: float = 0.0, dy: float = 0.0) -> None:
+    """直接畫三次曲線（給 OTF／CFF 用，不需轉換）。"""
+    shift = lambda p: (p[0] + dx, p[1] + dy)  # noqa: E731
+    for ops in contours:
+        pen.moveTo(shift(ops[0][1]))
+        for op in ops[1:]:
+            if op[0] == "L":
+                pen.lineTo(shift(op[1]))
+            else:
+                pen.curveTo(shift(op[1]), shift(op[2]), shift(op[3]))
+        pen.closePath()
+
+
 def bounds(contours) -> tuple[float, float] | None:
     xs = [p[0] for ops in contours for op in ops for p in op[1:]]
     return (min(xs), max(xs)) if xs else None
