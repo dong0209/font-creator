@@ -62,10 +62,28 @@ class Project:
         return Image.open(self.root / "refs" / f"{index}.png").convert("RGB")
 
 
+def normalize_image(image: Image.Image) -> Image.Image:
+    """統一成 RGB／RGBA：處理 EXIF 旋轉、CMYK、16-bit、調色盤、動畫第一格等格式。"""
+    from PIL import ImageOps
+
+    if getattr(image, "is_animated", False):
+        image.seek(0)
+    image = ImageOps.exif_transpose(image)
+    if image.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+        import numpy as np
+
+        a = np.asarray(image, dtype=np.float64)
+        hi = a.max() or 1
+        image = Image.fromarray((a / hi * 255).astype("uint8"))
+    has_alpha = image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+    return image.convert("RGBA" if has_alpha else "RGB")
+
+
 def create_project(work_dir: Path, image: Image.Image, filename: str = "") -> Project:
     pid = uuid.uuid4().hex[:12]
     root = work_dir / pid
     (root / "refs").mkdir(parents=True)
+    image = normalize_image(image)
     image.save(root / "source.png")
 
     seg = segment.segment(image)
@@ -130,6 +148,11 @@ class Manager:
             run = p.data.get("run")
             if run and run.get("status") in ("queued", "running"):
                 p.update_run(status="paused", message="伺服器重新啟動，按「繼續」接著生成")
+            stale = [v for v in p.data.get("previews", []) if v.get("status") in ("queued", "running")]
+            for v in stale:
+                v.update(status="error", message="伺服器重新啟動，這次試生成已中斷，請重新按「試生成」")
+            if stale:
+                p.save()
             self._projects[p.id] = p
 
     def create(self, image: Image.Image, filename: str = "") -> Project:
@@ -362,8 +385,9 @@ class Manager:
             made += len(batch)
             done += len(batch)
             rate = (time.time() - t0) / made
+            note = getattr(gen, "fallback_reason", None)
             p.update_run(done=done, rate=round(rate, 3), skipped=skipped,
-                         message=f"生成中（每字約 {rate:.2f} 秒）")
+                         message=f"生成中（每字約 {rate:.2f} 秒）" + (f"\n{note}" if note else ""))
 
         p.update_run(message="描圖並組合字型檔中…")
         images = {}
@@ -374,7 +398,8 @@ class Manager:
         sources, space, latin_name = self._sources(p, chain, images, latin_chars, run.get("latin_font", ""))
         family = fontbuild.nc_family_name(run["family"])
         out = p.root / "output" / f"{fontbuild._ps_name(family)}.ttf"
-        info = fontbuild.build_font(self._spec(p, family, sources, chain, space), out)
+        info = fontbuild.build_font(self._spec(p, family, sources, chain, space), out,
+                                    progress=lambda i, n: p.update_run(message=f"描圖並組合字型檔中…（{i:,} / {n:,}）"))
         p.update_run(status="done", message="完成", output=out.name, family=info["family"],
                      glyph_count=info["glyphs"], empty=info["empty"], latin_font_name=latin_name,
                      finished=_now())

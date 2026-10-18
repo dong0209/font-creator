@@ -182,6 +182,7 @@ function renderAnalysis(p) {
   $("features").replaceChildren(...a.features.map((f) =>
     el("tr", {}, el("td", {}, f.label), el("td", {}, f.value === null ? "—" : `${f.value} ${f.unit}`), el("td", {}, f.text))));
   $("analysis-meta").textContent = `偵測到 ${a.glyph_count} 個字、${a.line_count} 行${a.inverted ? "（淺字深底，已自動反相）" : ""}。`;
+  $("analysis-warn").replaceChildren(...(a.warnings || []).map((w) => el("li", {}, w)));
   $("refs-card").hidden = false;
   $("run-card").hidden = false;
 }

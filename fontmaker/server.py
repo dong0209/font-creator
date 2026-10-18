@@ -14,6 +14,14 @@ from pydantic import BaseModel, Field
 from . import charsets, config, fontscan, generator, jobs
 
 MAX_UPLOAD = 30 * 1024 * 1024
+MAX_PIXELS = 50_000_000
+
+try:  # iPhone 照片（HEIC）
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
 
 
 class PreviewRequest(BaseModel):
@@ -95,8 +103,12 @@ def create_app(manager: jobs.Manager | None = None, require_setup: bool = True) 
             raise HTTPException(413, "圖片超過 30MB")
         try:
             image = Image.open(io.BytesIO(raw))
+            if image.width * image.height > MAX_PIXELS:
+                raise HTTPException(413, f"圖片太大（{image.width}×{image.height}），請縮小到 5000 萬像素以內")
             image.load()
-        except (UnidentifiedImageError, OSError):
+        except Image.DecompressionBombError:
+            raise HTTPException(413, "圖片像素太多，請先縮小再上傳")
+        except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
             raise HTTPException(400, "無法讀取這個圖片檔")
         # 切字與分析很吃 CPU，放到執行緒池，避免卡住其他請求
         p = await run_in_threadpool(manager.create, image, file.filename or "")

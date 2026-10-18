@@ -62,6 +62,7 @@ class Segmentation:
     glyphs: list[Glyph] = field(default_factory=list)
     lines: list[list[int]] = field(default_factory=list)  # 每行包含的 glyph index
     inverted: bool = False  # 原圖是否為淺字深底
+    blur: float = 0.0  # 估計的模糊程度（高斯 σ，像素）
 
 
 def load_gray(image: Image.Image) -> np.ndarray:
@@ -78,19 +79,61 @@ def load_gray(image: Image.Image) -> np.ndarray:
     return gray
 
 
+def _background(gray: np.ndarray) -> np.ndarray:
+    """估計背景亮度（深字淺底）：在縮小圖上做灰階 closing 把文字抹掉，再放大回來。"""
+    h, w = gray.shape
+    f = max(1, min(h, w) // 300)
+    small = cv2.resize(gray, (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA)
+    k = max(15, (min(small.shape) // 8) | 1)
+    bg = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    bg = cv2.GaussianBlur(bg, (0, 0), k / 4)
+    return cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def binarize(gray: np.ndarray) -> tuple[np.ndarray, bool]:
     """回傳 (墨跡 bool 陣列, 是否反相)。"""
+    ink, inverted, _ = _binarize(gray)
+    return ink, inverted
+
+
+def _binarize(gray: np.ndarray) -> tuple[np.ndarray, bool, np.ndarray]:
+    """回傳 (墨跡, 是否反相, 校正背景後的灰階)。
+
+    先判斷深字淺底或淺字深底（背景佔大多數面積，所以中位數接近背景），
+    再除以估計出的背景亮度抵銷光影不均，最後用 Otsu 找門檻。
+    """
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    border = np.concatenate([th[0], th[-1], th[:, 0], th[:, -1]])
-    background_is_white = np.mean(border > 127) >= 0.5
-    ink = th < 128 if background_is_white else th > 127
-    if ink.mean() > 0.45:
-        # 光線不均的照片：Otsu 會把大片陰影當成墨跡，改用區域門檻
-        block = max(15, (min(gray.shape) // 20) | 1)
-        th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 10)
-        ink = th < 128 if background_is_white else th > 127
-    return ink, not background_is_white
+    otsu, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    inverted = float(np.median(blur)) < otsu
+    if inverted:
+        blur = 255 - blur
+    bg = _background(blur).astype(np.float32)
+    norm = np.clip(blur.astype(np.float32) / np.maximum(bg, 1) * 255, 0, 255).astype(np.uint8)
+    _, th = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ink = th < 128
+    if ink.mean() > 0.5:  # 幾乎全黑：沒有可辨識的文字
+        ink = np.zeros_like(ink)
+    return ink, inverted, norm
+
+
+def estimate_blur(norm: np.ndarray, ink: np.ndarray) -> float:
+    """估計邊緣的模糊程度（高斯 σ，像素）。
+
+    高斯模糊後的階梯邊緣，最大斜率 = 對比 ÷ (√(2π)·σ)，所以 σ ≈ 對比 ÷ (√(2π)·邊緣最大斜率)。
+    """
+    if ink.sum() < 50 or (~ink).sum() < 50:
+        return 0.0
+    g = norm.astype(np.float32)
+    contrast = float(np.median(g[~ink]) - np.median(g[ink]))
+    if contrast <= 10:
+        return 0.0
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3) / 8
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3) / 8
+    mag = np.hypot(gx, gy)
+    u8 = ink.astype(np.uint8)
+    edge = (cv2.dilate(u8, np.ones((3, 3), np.uint8)) - cv2.erode(u8, np.ones((3, 3), np.uint8))).astype(bool)
+    peak = float(np.percentile(mag[edge], 90)) if edge.any() else 0.0
+    return contrast / (np.sqrt(2 * np.pi) * peak) if peak > 0 else 0.0
 
 
 def _components(ink: np.ndarray) -> list[Box]:
@@ -170,8 +213,10 @@ def _merge_line(members: list[Box]) -> tuple[list[Box], float]:
             a, b = merged[i], merged[i + 1]
             gap = b.x0 - a.x1
             u = a.union(b)
-            narrow = a.w < 0.7 * line_h and b.w < 0.7 * line_h
-            if narrow and gap < 0.35 * line_h and u.w <= 1.1 * line_h and u.h >= 0.6 * line_h:
+            narrow = a.w < 0.8 * line_h and b.w < 0.8 * line_h
+            fits = u.w <= 1.15 * line_h and u.h >= 0.6 * line_h
+            # 外框互相重疊（如「你」的亻與尔）或兩塊都窄且靠得近（如「川」「八」）
+            if fits and (gap < 0 or (narrow and gap < 0.35 * line_h)):
                 merged[i : i + 2] = [u]
                 changed = True
                 break
@@ -186,18 +231,87 @@ def _score(box: Box, ink: np.ndarray, line_h: float) -> float:
     # 筆畫複雜度：墨跡邊界長度相對字高
     edges = cv2.Canny(ink.astype(np.uint8) * 255, 50, 150)
     complexity = min(1.0, edges.sum() / 255 / max(1, box.h) / 12)
-    return round(float(0.4 * square + 0.3 * size + 0.3 * complexity), 3)
+    score = 0.4 * square + 0.3 * size + 0.3 * complexity
+    if max(box.w, box.h) < 0.6 * line_h:  # 標點等小符號不適合當參考字
+        score *= 0.3
+    return round(float(score), 3)
+
+
+def _merge_thin_lines(lines: list[list[Box]], boxes: list[Box]) -> list[list[Box]]:
+    """合併「加起來還不到一個字高」的相鄰行。
+
+    「一」「二」這類只由橫畫組成的字，筆畫上下不重疊，會被拆成好幾行；
+    字高以部件高度與寬度的第 90 百分位估計（橫畫雖扁但很寬）。正常的兩行文字合起來超過兩個字高，不會被合併。
+    """
+    if len(lines) < 2:
+        return lines
+    char = max(float(np.percentile([b.h for b in boxes], 90)), float(np.percentile([b.w for b in boxes], 90)))
+
+    def span(members):
+        out = members[0]
+        for b in members[1:]:
+            out = out.union(b)
+        return out
+
+    ordered = sorted(lines, key=lambda m: span(m).y0)
+    merged = [ordered[0]]
+    for members in ordered[1:]:
+        if span(merged[-1] + members).h <= 1.2 * char:
+            merged[-1] = merged[-1] + members
+        else:
+            merged.append(members)
+    return merged
+
+
+def _has_grid_gaps(boxes: list[Box], whole: Box) -> bool:
+    """是否同時有貫穿整體的直向與橫向空隙（多個字排成格狀時才會有）。"""
+    cols = np.zeros(whole.w, bool)
+    rows = np.zeros(whole.h, bool)
+    for b in boxes:
+        cols[b.x0 - whole.x0 : b.x1 - whole.x0] = True
+        rows[b.y0 - whole.y0 : b.y1 - whole.y0] = True
+    return bool((~cols[1:-1]).any() and (~rows[1:-1]).any())
+
+
+def _single_glyph(rows: list[tuple[list[Box], float]]) -> Box | None:
+    """整張圖只有一個字時（例如單獨的「鬱」「三」「八」），部件分開會被切成好幾塊，這裡把它們合回一個字。
+
+    判斷：區塊數 2–6 個、全部墨跡的外框不會太扁或太長，而且看不出是多個字：
+    「像完整字的區塊」（夠大又接近方形）在同一行出現兩個以上（如「川小」），
+    或同時有貫穿整體的直向與橫向空隙（格狀排列，如 2×2 的四個字），就當作多個字。
+    """
+    boxes = [b for row, _ in rows for b in row]
+    if not 2 <= len(boxes) <= 6:
+        return None
+    whole = boxes[0]
+    for b in boxes[1:]:
+        whole = whole.union(b)
+    if not 0.5 <= whole.h / max(whole.w, 1) <= 2.0:
+        return None
+    size = max(whole.w, whole.h)
+
+    def char_like(b: Box) -> bool:
+        return min(b.w, b.h) >= 0.42 * size and 0.6 <= b.w / max(b.h, 1) <= 1.6
+
+    if any(sum(char_like(b) for b in row) >= 2 for row, _ in rows):
+        return None
+    if _has_grid_gaps(boxes, whole):
+        return None
+    return whole
 
 
 def segment(image: Image.Image) -> Segmentation:
     gray = load_gray(image)
-    ink, inverted = binarize(gray)
-    result = Segmentation(ink=ink, inverted=inverted)
+    ink, inverted, norm = _binarize(gray)
+    result = Segmentation(ink=ink, inverted=inverted, blur=estimate_blur(norm, ink))
     boxes = _components(ink)
     if not boxes:
         return result
-    for line_no, members in enumerate(_group_lines(boxes)):
-        merged, line_h = _merge_line(members)
+    rows = [_merge_line(members) for members in _merge_thin_lines(_group_lines(boxes), boxes)]
+    whole = _single_glyph(rows)
+    if whole is not None:
+        rows = [([whole], float(whole.h))]
+    for line_no, (merged, line_h) in enumerate(rows):
         ids = []
         for box in merged:
             crop = ink[box.y0 : box.y1, box.x0 : box.x1]

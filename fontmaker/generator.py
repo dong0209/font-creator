@@ -74,6 +74,7 @@ class FontDiffuserGenerator:
         self.device = pick_device(device or config.DEVICE)
         self.steps = steps
         self.batch_size = config.BATCH_SIZE or DEFAULT_BATCH.get(self.device, 8)
+        self.fallback_reason: str | None = None
         self._lock = threading.Lock()
 
         args = get_parser().parse_args([])
@@ -105,7 +106,22 @@ class FontDiffuserGenerator:
         ])
 
     def generate(self, contents: list[Image.Image], style: Image.Image, seed: int = 123) -> list[Image.Image]:
-        """contents：內容字圖（128×128 RGB）；style：風格參考圖。回傳 96×96 生成結果。"""
+        """contents：內容字圖（128×128 RGB）；style：風格參考圖。回傳 96×96 生成結果。
+
+        Apple GPU（MPS）遇到不支援的運算時，自動改用 CPU 重跑（之後都用 CPU）。
+        """
+        try:
+            return self._generate(contents, style, seed)
+        except (RuntimeError, NotImplementedError) as exc:
+            if self.device != "mps":
+                raise
+            self.fallback_reason = f"Apple GPU 不支援部分運算，已改用 CPU（{exc}）"
+            print(self.fallback_reason)
+            self.device = "cpu"
+            self.pipe.model.to("cpu")
+            return self._generate(contents, style, seed)
+
+    def _generate(self, contents: list[Image.Image], style: Image.Image, seed: int) -> list[Image.Image]:
         torch = self.torch
         if not contents:
             return []

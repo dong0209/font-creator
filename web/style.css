@@ -88,3 +88,5 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 #history-list { padding-left: 20px; }
 #history-list a { color: var(--accent); }
 footer { color: var(--muted); font-size: 13px; padding-bottom: 32px; }
+.warn-list { margin: 8px 0 0; padding-left: 20px; color: #b4561b; font-size: 14px; }
+.warn-list:empty { display: none; }

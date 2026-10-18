@@ -80,7 +80,7 @@ def target_from_analysis(analysis: dict) -> dict:
         "contrast": _feature(analysis, "contrast") or 1.3,
         "roundness": None if roundness is None else roundness / 100,
         "slant": analysis.get("slant", 0.0),
-        "handwriting": analysis.get("style", "").startswith("手寫"),
+        "handwriting": analysis.get("style", "").startswith(("手寫", "楷書")),
     }
 
 

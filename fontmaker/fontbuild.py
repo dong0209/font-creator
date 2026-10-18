@@ -3,6 +3,8 @@
 非商業用途標記：字型家族名稱一律帶「NC」字尾（例如「MyHand NC」），程式不提供移除選項。
 """
 
+import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,8 +29,13 @@ def nc_family_name(name: str) -> str:
 
 
 def _ps_name(family: str) -> str:
-    ascii_only = re.sub(r"[^A-Za-z0-9-]", "", family.replace(" ", "-"))
-    return (ascii_only.strip("-") or "GeneratedNC")[:63]
+    """PostScript 名稱只能用英數字。中文名稱轉不出來時，用名稱的雜湊值區分，避免不同字型撞名。"""
+    ascii_only = re.sub(r"[^A-Za-z0-9-]", "", family.replace(" ", "-")).strip("-")
+    meaningful = re.sub(rf"-?{NC_SUFFIX}$", "", ascii_only, flags=re.IGNORECASE)
+    if not meaningful:
+        digest = hashlib.sha1(family.encode("utf-8")).hexdigest()[:8]
+        ascii_only = f"Font{digest}-{NC_SUFFIX}"
+    return ascii_only[:63]
 
 
 def _is_fullwidth(ch: str) -> bool:
@@ -65,7 +72,38 @@ def _notdef():
     return pen.glyph()
 
 
-def build_font(spec: FontSpec, out_path: str | Path) -> dict:
+def _trace_job(args):
+    image, placement, weight_delta = args
+    return vectorize.trace(image, placement, UPM, weight_delta)
+
+
+def trace_all(sources: list[GlyphSource], progress=None) -> list:
+    """描出所有需要描圖的字。字多時用多個 CPU 核心平行處理（5,000 字單核約十分鐘）。"""
+    todo = [i for i, src in enumerate(sources) if src.contours is None]
+    results: dict[int, list] = {}
+    workers = max(1, (os.cpu_count() or 2) - 1)
+    jobs = [(sources[i].image, sources[i].placement, sources[i].weight_delta) for i in todo]
+    if len(todo) >= 200 and workers > 1:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for n, contours in enumerate(pool.map(_trace_job, jobs, chunksize=32)):
+                    results[todo[n]] = contours
+                    if progress is not None and n % 100 == 0:
+                        progress(n, len(todo))
+        except Exception:  # noqa: BLE001 - 平行處理失敗（例如環境不允許開子程序）就改用單核
+            results.clear()
+    for n, i in enumerate(todo):
+        if i not in results:
+            results[i] = _trace_job(jobs[n])
+            if progress is not None and n % 100 == 0:
+                progress(n, len(todo))
+    return [results.get(i, src.contours) for i, src in enumerate(sources)]
+
+
+def build_font(spec: FontSpec, out_path: str | Path, progress=None) -> dict:
+    """progress(已完成, 總數)：描圖很花時間，定期回報進度。"""
     family = nc_family_name(spec.family)
     order = [".notdef", "space", "uni3000"]
     cmap = {0x20: "space", 0x3000: "uni3000"}
@@ -73,15 +111,12 @@ def build_font(spec: FontSpec, out_path: str | Path) -> dict:
     metrics = {".notdef": (UPM, 100), "space": (round(spec.space_advance * UPM), 0), "uni3000": (UPM, 0)}
     empty = []
 
-    for src in spec.glyphs:
+    traced = trace_all(spec.glyphs, progress)
+    for src, contours in zip(spec.glyphs, traced):
         cp = ord(src.char)
         if cp in cmap:
             continue
         name = f"uni{cp:04X}" if cp <= 0xFFFF else f"u{cp:05X}"
-        if src.contours is not None:
-            contours = src.contours
-        else:
-            contours = vectorize.trace(src.image, src.placement, UPM, src.weight_delta)
         span = vectorize.bounds(contours)
         if span is None:
             empty.append(src.char)
